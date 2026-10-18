@@ -93,8 +93,8 @@ When the server tells you your own mask (your JOIN echo, for one), call
 Until then the chunk budget assumes the longest mask bahamut allows.
 
 A message that cannot be delivered is always a `SendFailed` event with a
-reason (`unpinned-nick`, `queue-full`, `keys-timeout`, `key-mismatch`,
-`rekey-throttled`, ...) and the number of messages lost. There is no other
+reason (`unpinned-nick`, `unencodable`, `queue-full`, `keys-timeout`,
+`key-mismatch`, `rekey-throttled`, ...) and the number of messages lost. There is no other
 failure path.
 
 Inner messages are JSON objects with a `t` field: `text`, `action`, `chal` and
