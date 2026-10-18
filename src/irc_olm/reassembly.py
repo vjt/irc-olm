@@ -95,16 +95,19 @@ class Reassembler:
             self._pending.pop(sender, None)
 
     def _cap_total(self) -> None:
-        """Drop the messages that went longest without a fragment until what
-        is buffered, all senders together, fits `max_bytes_total`."""
-        pending = sorted((p.last, sender, msgid, p.size)
-                         for sender, mine in self._pending.items() for msgid, p in mine.items())
-        total = sum(size for *_, size in pending)
-        for _, sender, msgid, size in pending:
-            if total <= self.max_bytes_total:
-                return
+        """Until what is buffered, all senders together, fits
+        `max_bytes_total`: drop the idlest message of the sender holding the
+        most. Not the idlest overall: paced, an honest long message is it."""
+        held = {sender: sum(p.size for p in mine.values()) for sender, mine in self._pending.items()}
+        total = sum(held.values())
+        while total > self.max_bytes_total:
+            sender = max(held, key=held.get)
+            msgid, p = min(self._pending[sender].items(), key=lambda kv: kv[1].last)
             self._drop(sender, msgid)
-            total -= size
+            held[sender] -= p.size
+            total -= p.size
+            if sender not in self._pending:
+                del held[sender]
 
     def _expire(self) -> None:
         cutoff = self.clock() - self.timeout

@@ -281,3 +281,13 @@ def test_a_nack_for_a_long_message_still_finds_it_minutes_later(net):
     res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
     assert not [e for e in res.events if isinstance(e, Dropped)]
     assert res.outbound                               # re-keying to re-send it
+
+
+def test_the_resend_memory_is_bounded_in_messages_too(net):
+    from irc_olm.engine import SENT_MAX, Dropped
+    bot, vjt = establish(net)
+    refs = [msgid_of(bot.send("vjt", {"t": "text", "body": f"m{i}"})) for i in range(SENT_MAX + 1)]
+    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": refs[0]})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
+    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": refs[-1]})
+    assert not [e for e in res.events if isinstance(e, Dropped)]

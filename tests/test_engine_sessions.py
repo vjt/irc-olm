@@ -255,15 +255,17 @@ def test_a_replayed_fallback_prekey_message_is_refused_after_a_restart(net):
     assert any(isinstance(e, Replayed) for e in res.events)
 
 
-def test_keyreq_answers_are_rate_limited_per_nick(net):
+def test_keyreq_answers_are_rate_limited_per_nick_to_the_keyreq_retry(net):
+    # A KEYS is two lines, 8 s of our flood bank: once per retry, no more.
+    from irc_olm.engine import KEYREQ_RETRY
     bot, vjt = paired(net)
     first = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
-    net.clock.t += 5
+    net.clock.t += KEYREQ_RETRY - 1
     second = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
     assert {framing.parse(b).verb for _, b in first.outbound} == {"KEYS"}
     assert second.outbound == []
     assert [e.reason for e in second.events if isinstance(e, Dropped)] == ["keyreq-rate-limited"]
-    net.clock.t += 6
+    net.clock.t += 1
     assert net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound
 
 
@@ -291,11 +293,11 @@ def test_queued_messages_that_expire_are_reported_lost(net):
 
 
 def test_the_fallback_key_rotates_weekly(net):
-    from irc_olm.engine import FALLBACK_ROTATE
+    from irc_olm.engine import FALLBACK_ROTATE, KEYS_INTERVAL
 
     def fallback_after_two_keyreqs():
         net.inject("vjt", "bot", "KEYREQ", {"v": 1})
-        net.clock.t += 11
+        net.clock.t += KEYS_INTERVAL     # inside the minute: the fallback key
         (k,) = [framing.decode_payload("".join(framing.parse(b).chunk for _, b in
                 net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound))["otk"]]
         assert k["fallback"] is True
@@ -400,3 +402,20 @@ def test_control_lines_and_challenges_are_urgent_text_is_not(net):
     bot.forget_sessions(vjt.fingerprint)
     nack = feed(bot, "vjt", vjt.send("bot", {"t": "text", "body": "lost"}))
     assert ids(nack, "NACK") and ids(nack, "NACK") <= nack.urgent
+
+
+def test_olm_decrypts_a_message_that_overtook_as_many_as_the_pacer_lets_queue(net):
+    # Pins the pacer's per-target text cap against vodozemac's skipped keys.
+    from irc_olm.pacing import DEFAULT_MAX_TEXT_MESSAGES
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ciao"}))
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "ciao"}))
+    net.take("bot")
+    queued = [vjt.send("bot", {"t": "text", "body": f"m{i}"}) for i in range(DEFAULT_MAX_TEXT_MESSAGES)]
+    chal = vjt.send("bot", {"t": "chal", "nonce": "x"})
+    events = []
+    for r in [chal] + queued:                                  # the pacer's order
+        for _, body in r.outbound:
+            events += bot.receive("vjt", body).events
+    assert [e for e in events if isinstance(e, Undecryptable)] == []
+    assert len(texts(events)) == DEFAULT_MAX_TEXT_MESSAGES

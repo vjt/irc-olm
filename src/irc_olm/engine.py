@@ -44,15 +44,17 @@ ID_SIG_PREFIX = "irc-e2e:v1:id:"
 OTK_SIG_PREFIX = "irc-e2e:v1:otk:"
 
 KEYREQ_RETRY = 30.0          # re-ask for keys when still waiting after this long
-KEYS_INTERVAL = 10.0         # at most one KEYS answer per nick in this long
+KEYS_INTERVAL = KEYREQ_RETRY # at most one KEYS answer per nick in this long: two
+                             # lines, 8 s of our flood bank
 OUTQ_TTL = 60.0              # queued plaintext waiting for keys
 OUTQ_MAX = 16
 REKEY_INTERVAL = 60.0        # spec: at most one new session per peer per minute
 OTK_PER_NICK_INTERVAL = 60.0 # one one-time key per nick per minute, else the fallback
 OTK_GLOBAL_PER_HOUR = 30
-SENT_MEMORY = 600.0          # plaintexts kept for a re-send after a NACK. Under
-                             # bahamut's flood bank a 64-line message leaves one
-                             # line every ~5 s: its NACK comes minutes after send()
+SENT_MEMORY = 1800.0         # plaintexts kept for a re-send after a NACK. Under
+                             # bahamut's flood bank a full pacer backlog (480 s of
+                             # bank) takes twice that with the bot talking meanwhile
+SENT_MAX = 512               # and at most this many
 MAX_SENDS = 2                # a message goes out at most twice: once, and once
                              # more on a fresh session after a NACK
 URGENT_INNER = ("chal", "ack")  # inner types that must not wait behind text
@@ -805,7 +807,8 @@ class Engine:
 
     def _trim_sent(self) -> None:
         cutoff = self._now() - SENT_MEMORY
-        while self._sent and next(iter(self._sent.values())).at < cutoff:
+        while self._sent and (len(self._sent) > SENT_MAX
+                              or next(iter(self._sent.values())).at < cutoff):
             self._sent.popitem(last=False)
 
     def _now(self) -> float:

@@ -149,3 +149,21 @@ def test_buffered_bytes_are_capped_across_senders_oldest_first():
     assert r.feed("nick0", msgs[0][1]) is None    # evicted: its rest starts over
     assert isinstance(r.feed("nick5", msgs[5][1]), Assembled)
     assert isinstance(r.feed("nick4", msgs[4][1]), Assembled)
+
+
+def test_the_global_cap_takes_from_the_sender_holding_the_most_first():
+    # Paced, an honest long message is the idlest one: idleness alone would
+    # pick it first, while other senders keep theirs freshly touched.
+    r, clock = make(max_bytes_total=6000)
+    _, vjt = frags(3000)                         # 9 fragments, ~4.1 KB whole
+    _, mal0 = frags(6000)
+    _, mal1 = frags(6000)
+    for f in vjt[:2]:
+        assert r.feed("vjt", f) is None
+    clock.t += 1
+    for f in mal0[:9]:
+        r.feed("mal0", f)
+    for f in mal1[:3]:
+        r.feed("mal1", f)                         # past 6000: mal0's goes, not vjt's
+    assert isinstance([r.feed("vjt", f) for f in vjt[2:]][-1], Assembled)
+    assert r.feed("mal0", mal0[9]) is None        # it starts over
