@@ -71,6 +71,8 @@ engine = Engine("azzurra.state.json", store.load_key("azzurra.key"),
 pacer = PacedSender(lambda target, body: send_raw(f"PRIVMSG {target} :{body}"))
 
 def dispatch(result):
+    # Lines leave in the order the engine produced them: call the engine and
+    # dispatch its Result under one lock when several threads use it.
     pacer.submit_all(result.outbound)
     for event in result.events:
         handle(event)                    # Received, KeyAlarm, AckOk, ...
@@ -92,10 +94,17 @@ When the server tells you your own mask (your JOIN echo, for one), call
 `engine.set_own_mask("nick!user@host")`, and again after your own NICK change.
 Until then the chunk budget assumes the longest mask bahamut allows.
 
-A message that cannot be delivered is always a `SendFailed` event with a
-reason (`unpinned-nick`, `unencodable`, `queue-full`, `keys-timeout`,
-`key-mismatch`, `rekey-throttled`, ...) and the number of messages lost. There is no other
-failure path.
+Every failure the engine can see is a `SendFailed` event with a reason
+(`unpinned-nick`, `unencodable`, `too-long`, `queue-full`, `keys-timeout`,
+`key-mismatch`, `rekey-throttled`, `resend-failed`, `repinned`,
+`nack-from-another-nick`, ...) and the number of messages lost; `send()` never
+raises. `challenge()` raises `NotPinnedError` for a nick without a pinned key:
+ask `pinned()` first, under the same lock. IRC itself has no delivery receipt.
+A line the server drops (no such nick, the receiver's CTCP flood limit), that a
+broken connection eats, or that the pacer refuses (`submit_all` returns how
+many lines it refused, and logs them) is lost without an event, like any IRC
+line. What a peer receives and cannot decrypt, it NACKs, and the message is
+sent once more.
 
 Inner messages are JSON objects with a `t` field: `text`, `action`, `chal` and
 `ack` (SAS messages only ever travel between two cicchettos). `ack` is handled
@@ -111,10 +120,14 @@ of `repr()`, but log lengths, never bodies.
   one the operator pasted in its place.
 - **Nothing moves before a session proves it.** An id block is public and
   replayable, and its signature only says the Ed25519 key claims that
-  curve25519 key. A peer's curve is stored, and the nick it is reached at
-  moves, only once a session exists: one opened on keys we asked for, or one
-  whose first message decrypted. One curve belongs to one pinned key; a second
-  key claiming it is refused. Keys are compared in vodozemac's one spelling.
+  curve25519 key. A peer's curve is stored only once a session exists, and the
+  nick it is reached at moves only once a message decrypted. A curve learned
+  from keys we asked for is a claim until a message decrypts on it; a pre-key
+  message that decrypts proves the curve and takes it from a key that only
+  claimed it. One curve belongs to one pinned key; a second key claiming a
+  proven curve is refused, and nobody may claim ours. A nick hint names one
+  key: the last one that spoke from it. Keys are compared in vodozemac's one
+  spelling.
 - **Known limit (unknown key-share).** The inner message does not name the
   sender's and recipient's Ed25519 keys (Matrix puts both inside). The rules
   above close it except for one window: a pinned peer that captures another
@@ -125,10 +138,15 @@ of `repr()`, but log lengths, never bodies.
   would decrypt the old plaintext again. Seen session ids are persisted, and a
   replayed one is never decrypted. The fallback key also rotates weekly, and
   vodozemac forgets a fallback key two rotations later.
-- **Recovery.** A NACK re-sends on a newer session when there is one, and
-  otherwise opens a new one (at most one per peer per minute). Messages sent
-  while keys are being asked for wait for the new session instead of going
-  out on the session that just failed.
+- **Recovery.** Every message that does not decrypt gets its own NACK, but
+  only when its sender's nick is where the key it claims is reached: a pinned
+  key's curve and id block are public, and a NACK to every nick that puts them
+  on a line would answer nicks no pinned key ever used. A NACKed message is
+  re-sent once, on a newer session when there is one, otherwise on a new one
+  (at most one per peer per minute). Messages sent while keys are being asked
+  for wait for the new session instead of going out on the session that just
+  failed. A NACK from a nick the message was not sent to re-sends nothing (it
+  is not authenticated) and is reported as a loss.
 - **Order challenges** (`Engine.challenge`) go only to a pinned key. Each one
   is single use and expires after 15 s.
 - **Threat model.** Whoever owns the bot's host owns its key and reads its side
