@@ -42,11 +42,15 @@ class _Pending:
 class Reassembler:
     def __init__(self, *, timeout: float = 60.0, max_fragments: int = MAX_FRAGMENTS,
                  max_bytes_per_sender: int = 32 * 1024, max_pending_per_sender: int = 8,
+                 max_bytes_total: int = 512 * 1024,
                  clock: Callable[[], float] = time.monotonic):
         self.timeout = timeout
         self.max_fragments = max_fragments
         self.max_bytes = max_bytes_per_sender
         self.max_pending = max_pending_per_sender
+        # A message lives `timeout` from its LAST fragment, so one fragment a
+        # minute keeps it alive: a sender changing nicks needs this cap too.
+        self.max_bytes_total = max_bytes_total
         self.clock = clock
         self._pending: dict[str, dict[str, _Pending]] = {}
 
@@ -75,6 +79,7 @@ class Reassembler:
         if sum(q.size for q in mine.values()) > self.max_bytes:
             return self._reject(sender, frag.msgid, "sender-byte-cap")
         if len(p.chunks) < p.total:
+            self._cap_total()
             return None
         self._drop(sender, frag.msgid)
         return Assembled(p.verb, frag.msgid, "".join(p.chunks[i] for i in range(1, p.total + 1)))
@@ -88,6 +93,18 @@ class Reassembler:
         mine.pop(msgid, None)
         if not mine:
             self._pending.pop(sender, None)
+
+    def _cap_total(self) -> None:
+        """Drop the messages that went longest without a fragment until what
+        is buffered, all senders together, fits `max_bytes_total`."""
+        pending = sorted((p.last, sender, msgid, p.size)
+                         for sender, mine in self._pending.items() for msgid, p in mine.items())
+        total = sum(size for *_, size in pending)
+        for _, sender, msgid, size in pending:
+            if total <= self.max_bytes_total:
+                return
+            self._drop(sender, msgid)
+            total -= size
 
     def _expire(self) -> None:
         cutoff = self.clock() - self.timeout

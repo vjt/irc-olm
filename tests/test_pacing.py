@@ -50,7 +50,7 @@ def drain(p, t0, step=0.05, until=600.0):
 
 def test_burst_then_one_line_every_window_per_target():
     p = Pacer(max_lines=3, window=6.0, fakelag=None)
-    p.submit("vjt", [f"l{i}" for i in range(7)])
+    p.submit("vjt", [f"l{i}" for i in range(7)], urgent=False)
     sent = drain(p, 0.0)
     times = [round(t, 2) for t, _, _ in sent]
     assert [line for _, _, line in sent] == [f"l{i}" for i in range(7)]
@@ -61,8 +61,8 @@ def test_burst_then_one_line_every_window_per_target():
 
 def test_targets_are_paced_independently():
     p = Pacer(max_lines=3, window=6.0, fakelag=None)
-    p.submit("a", ["a1", "a2", "a3", "a4"])
-    p.submit("b", ["b1"])
+    p.submit("a", ["a1", "a2", "a3", "a4"], urgent=False)
+    p.submit("b", ["b1"], urgent=False)
     first = p.due(0.0)
     assert ("b", "b1") in first and ("a", "a3") in first and ("a", "a4") not in first
 
@@ -70,7 +70,7 @@ def test_targets_are_paced_independently():
 def test_next_wakeup_is_the_earliest_slot():
     p = Pacer(max_lines=3, window=6.0, fakelag=None)
     assert p.next_wakeup(0.0) is None
-    p.submit("a", ["1", "2", "3", "4"])
+    p.submit("a", ["1", "2", "3", "4"], urgent=False)
     p.due(1.0)
     assert p.next_wakeup(1.0) == pytest.approx(7.0)
 
@@ -87,7 +87,7 @@ def test_default_pacing_never_trips_bahamut_flud(seed):
     sent, now, i, k = [], 0.0, 0, 0
     while now < 1000 and (i < len(events) or p.pending()):
         while i < len(events) and events[i][0] <= now:
-            p.submit("vjt", ["x"] * events[i][1])
+            p.submit("vjt", ["x"] * events[i][1], urgent=False)
             i += 1
         sent += [now for _ in p.due(now)]
         k += 1
@@ -102,7 +102,7 @@ def test_default_pacing_never_trips_bahamut_flud(seed):
 def test_three_per_three_seconds_does_trip_it():
     # Pins the reason the default is not the obvious 3-per-3s window.
     p = Pacer(max_lines=3, window=3.0, fakelag=None)
-    p.submit("vjt", ["x"] * 6)
+    p.submit("vjt", ["x"] * 6, urgent=False)
     sent = [t for t, _, _ in drain(p, 0.0)]
     m = FludModel()
     assert any(m.ctcp("bot", math.floor(1000 + s)) for s in sent)
@@ -120,7 +120,7 @@ def test_paced_sender_thread_delivers_in_order():
             done.set()
 
     s = PacedSender(send, Pacer(max_lines=2, window=0.1, fakelag=None))
-    s.submit("vjt", ["1", "2", "3", "4", "5"])
+    s.submit("vjt", ["1", "2", "3", "4", "5"], urgent=False)
     assert done.wait(5)
     assert got == [("vjt", str(i)) for i in range(1, 6)]
 
@@ -137,7 +137,7 @@ def test_submit_all_keeps_order_per_target():
             done.set()
 
     s = PacedSender(send, Pacer(max_lines=3, window=0.1, fakelag=None))
-    s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")])
+    s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")], set())
     assert done.wait(5)
     assert [x for x in got if x[0] == "a"] == [("a", "a1"), ("a", "a2")]
     assert [x for x in got if x[0] == "b"] == [("b", "b1"), ("b", "b2")]
@@ -157,24 +157,28 @@ def test_paced_sender_survives_a_send_that_raises():
             done.set()
 
     s = PacedSender(send, Pacer(max_lines=3, window=0.1, fakelag=None))
-    s.submit("vjt", ["boom", "after"])
+    s.submit("vjt", ["boom", "after"], urgent=False)
     assert done.wait(2)
     assert got == ["after"]
 
 
-def test_pacer_refuses_a_whole_batch_past_its_per_target_cap():
-    p = Pacer(max_lines=3, window=6.0, max_queue=4, fakelag=None)
-    assert p.submit("vjt", ["1", "2", "3"]) is True
-    assert p.submit("vjt", ["4", "5"]) is False
-    assert p.pending() == 3
-    assert p.submit("other", ["a", "b", "c", "d"]) is True
+def test_text_past_the_connections_backlog_is_refused_whole_and_control_never_is():
+    line = "x" * 110                                   # costs 3 s to "vjt", 3 s to "other"
+    p = Pacer(max_backlog=9.0, fakelag=None)
+    assert p.submit("vjt", [line, line], urgent=False) is True
+    assert p.submit("other", [line, line], urgent=False) is False   # 12 s: the whole batch
+    assert p.pending() == 2
+    assert p.submit("other", [line], urgent=False) is True          # 9 s, across targets
+    assert p.submit("vjt", [line] * 5, urgent=True) is True         # control always goes
+    drain(p, 1000.0)
+    assert p.submit("other", [line] * 3, urgent=False) is True      # sent text frees it
 
 
 # --- fake lag (bahamut's flood bank) -------------------------------------
 
 from fakelag_model import ServerModel  # noqa: E402
 from irc_olm import framing  # noqa: E402
-from irc_olm.pacing import FakeLag  # noqa: E402
+from irc_olm.pacing import DEFAULT_WINDOW, FakeLag  # noqa: E402
 
 FULL = "x" * (400 - len("PRIVMSG vjt :"))      # a full E2E line, 400 bytes before CRLF
 
@@ -218,14 +222,14 @@ def test_fakelag_bank_drains_in_real_time_and_never_goes_negative():
 def test_three_lines_per_six_seconds_alone_get_a_long_sender_killed():
     # Pins why the per-target window is not enough on its own.
     p = Pacer(fakelag=None)
-    p.submit("vjt", [FULL] * 20)
+    p.submit("vjt", [FULL] * 20, urgent=False)
     server, _ = run_against_server(p)
     assert server.killed_at is not None
 
 
 def test_with_the_bank_no_line_ever_waits_unparsed_on_the_server():
     p = Pacer(fakelag=FakeLag())
-    p.submit("vjt", [FULL] * 64)
+    p.submit("vjt", [FULL] * 64, urgent=False)
     server, out = run_against_server(p)
     assert server.killed_at is None
     assert server.max_backlog == 0
@@ -239,7 +243,7 @@ def test_lines_the_application_writes_count_in_the_same_bank():
         for t, line in talk:
             lag.charge(line, t)       # the application charges what it writes itself
         p = Pacer(fakelag=lag)
-        p.submit("vjt", [FULL] * 20)
+        p.submit("vjt", [FULL] * 20, urgent=False)
         server, out = run_against_server(p, also=talk)
         assert server.killed_at is None and server.max_backlog == 0
         return out[-1][0]
@@ -257,20 +261,57 @@ def _message(n_lines_wanted, target="vjt"):
     return bodies
 
 
-def test_single_line_messages_go_ahead_of_a_long_messages_fragments():
+def test_urgent_messages_go_ahead_of_text_and_text_keeps_its_order():
     p = Pacer(fakelag=FakeLag())
     long_msg = _message(12)
-    p.submit("vjt", long_msg)
-    chal = _message(1)                  # a CHAL, queued after it: 15 s to live
-    p.submit("vjt", chal)
-    other = _message(1, target="lucy")
-    p.submit("lucy", other)
+    p.submit("vjt", long_msg, urgent=False)
+    short = _message(1)                 # text too: it must not overtake the long one
+    p.submit("vjt", short, urgent=False)
+    chal = _message(2)                  # a CHAL, two lines, queued last: 15 s to live
+    p.submit("vjt", chal, urgent=True)
+    other = _message(2, target="lucy")
+    p.submit("lucy", other, urgent=True)
     _, out = run_against_server(p)
     order = [body for _, _, body in out]
     sent_at = {body: t - 1000.0 for t, _, body in out}
-    assert sent_at[chal[0]] < 15 and sent_at[other[0]] < 15
-    assert order.index(chal[0]) < order.index(long_msg[-1])
+    assert sent_at[chal[-1]] < 15 and sent_at[other[-1]] < 15
+    assert order.index(chal[-1]) < order.index(long_msg[-1])
+    assert order.index(short[0]) > order.index(long_msg[-1])  # text in the order it came
     assert [b for b in order if b in long_msg] == long_msg     # its own order kept
+    assert [b for b in order if b in chal] == chal
+
+
+def test_submit_all_puts_the_engines_urgent_messages_in_the_fast_lane():
+    from irc_olm.pacing import PacedSender
+    long_msg, chal = _message(12), _message(2)
+    pacer = Pacer(fakelag=FakeLag())
+    s = PacedSender(lambda target, line: None, pacer, clock=lambda: 0.0)
+    with s._cv:                       # keep the thread off the queue while we look
+        refused = s.submit_all([("vjt", b) for b in long_msg + chal],
+                               {framing.parse(chal[0]).msgid})
+        assert refused == 0
+        assert [line for _, line in pacer.due(1000.0)] == chal[:1]   # 6 s of bank: no room
+        assert [line for _, line in pacer.due(1006.0)] == chal[1:]   # for a 5 s long line
+
+
+def test_text_the_pacer_accepts_leaves_while_the_engine_still_remembers_it():
+    # A NACK can only re-send what the engine still remembers: a full text
+    # backlog must drain, and the peer's NACK come back, within SENT_MEMORY.
+    from irc_olm.engine import SENT_MEMORY
+    p = Pacer(fakelag=FakeLag())
+    while p.submit("vjt", [FULL], urgent=False):
+        pass
+    _, out = run_against_server(p, until=SENT_MEMORY * 2)
+    assert out[-1][0] - out[0][0] + 60 <= SENT_MEMORY
+
+
+def test_an_idle_target_leaves_nothing_behind():
+    p = Pacer(fakelag=None)
+    for i in range(50):
+        p.submit(f"nick{i}", ["x"], urgent=False)
+    p.due(1000.0)
+    p.due(1000.0 + DEFAULT_WINDOW + 1)
+    assert p._sent == {} and p.pending() == 0
 
 
 def test_the_per_target_window_still_holds_for_single_lines():
@@ -279,7 +320,7 @@ def test_the_per_target_window_still_holds_for_single_lines():
     keyreq = lambda: framing.fragment("KEYREQ", framing.encode_payload({"v": 1}),  # noqa: E731
                                       own_mask="bot!b@h", target="vjt")[0]
     p = Pacer(fakelag=FakeLag())
-    p.submit("vjt", [keyreq() for _ in range(6)])
+    p.submit("vjt", [keyreq() for _ in range(6)], urgent=True)
     _, out = run_against_server(p)
     times = [round(t - 1000.0, 2) for t, _, _ in out]
     assert times[:3] == [0.0, 0.0, 0.0] and min(times[3:]) >= 6.0
@@ -287,7 +328,7 @@ def test_the_per_target_window_still_holds_for_single_lines():
 
 def test_a_bank_without_room_sets_the_next_wakeup_instead_of_spinning():
     p = Pacer(fakelag=FakeLag())
-    p.submit("vjt", [FULL] * 3)
+    p.submit("vjt", [FULL] * 3, urgent=False)
     assert len(p.due(1000.0)) == 2            # 5 s + 5 s: the bank is full
     assert p.due(1000.0) == []
     assert p.next_wakeup(1000.0) == 1005.0    # room for the third line, not "now"

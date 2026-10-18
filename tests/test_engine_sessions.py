@@ -372,3 +372,31 @@ def test_keys_with_a_signed_but_unusable_one_time_key_keep_the_queue(net, raw):
     net.clock.t += OUTQ_TTL + 1
     assert [(e.reason, e.lost) for e in bot.tick().events if isinstance(e, SendFailed)] == \
         [("keys-timeout", 1)]
+
+
+def test_control_lines_and_challenges_are_urgent_text_is_not(net):
+    from irc_olm.engine import Result
+
+    def ids(res, verb):
+        return {f.msgid for f in (framing.parse(b) for _, b in res.outbound) if f.verb == verb}
+
+    def feed(engine, src, res):
+        out = Result()
+        for _, body in res.outbound:
+            out.extend(engine.receive(src, body))
+        return out
+
+    bot, vjt = paired(net)
+    r = vjt.send("bot", {"t": "text", "body": "hi"})
+    assert ids(r, "KEYREQ") and ids(r, "KEYREQ") <= r.urgent
+    keys = feed(bot, "vjt", r)
+    assert ids(keys, "KEYS") and ids(keys, "KEYS") <= keys.urgent
+    flushed = feed(vjt, "bot", keys)
+    assert ids(flushed, "PKMSG") and not ids(flushed, "PKMSG") & flushed.urgent
+    feed(bot, "vjt", flushed)
+    _, chal = bot.challenge("vjt", network="n", channel="#c", sender_mask="vjt!v@h", line=b"!op")
+    sent = ids(chal, "PKMSG") | ids(chal, "MSG")
+    assert sent and sent <= chal.urgent
+    bot.forget_sessions(vjt.fingerprint)
+    nack = feed(bot, "vjt", vjt.send("bot", {"t": "text", "body": "lost"}))
+    assert ids(nack, "NACK") and ids(nack, "NACK") <= nack.urgent
