@@ -17,7 +17,9 @@ import os
 import re
 from dataclasses import dataclass
 
-VERBS = frozenset({"KEYREQ", "KEYS", "PKMSG", "MSG", "NACK", "OFFLINE"})
+# OFFLINE was in draft 7 and is gone (vjt, 2026-10-18 19:3x): no sender-side
+# delivery notices of any kind. Should one appear, it parses as an unknown verb.
+VERBS = frozenset({"KEYREQ", "KEYS", "PKMSG", "MSG", "NACK"})
 MAX_FRAGMENTS = 64
 DEFAULT_LINELEN = 512
 

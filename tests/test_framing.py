@@ -58,6 +58,7 @@ def test_parse_valid_fragment():
     "\x01VERSION\x01",                                   # other CTCP
     "\x01E2E MSG AAAAAAAAAAA 1/1 eyJ2IjoxfQ==",          # unterminated
     "\x01E2E FOO AAAAAAAAAAA 1/1 eyJ2IjoxfQ==\x01",      # unknown verb: ignored
+    "\x01E2E OFFLINE AAAAAAAAAAA 1/1 eyJ2IjoxfQ==\x01",  # dropped from the spec
     "\x01E2E MSG AAAAAAAAAA 1/1 eyJ2IjoxfQ==\x01",       # msgid too short
     "\x01E2E MSG AAAAAAAAAAA= 1/1 eyJ2IjoxfQ==\x01",     # padded msgid
     "\x01E2E MSG AAAAAAAAAAA 0/1 eyJ2IjoxfQ==\x01",      # 0-based index
