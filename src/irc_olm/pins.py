@@ -13,10 +13,10 @@ lets the bot say so loudly.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import os
 import re
+
+import vodozemac as vz
 
 from .framing import fold
 
@@ -38,8 +38,10 @@ def parse_pins(text: str, source: str = "pins") -> dict[str, str]:
             raise PinsError(f"{source}:{n}: expected '<nick> <ed25519 key>'")
         nick, key = parts
         try:
-            ok = _KEY.fullmatch(key) and len(base64.b64decode(key + "=", validate=True)) == 32
-        except binascii.Error:
+            # vodozemac refuses stray bits in the last character too, so a
+            # key has one spelling and two spellings never pin one key twice.
+            ok = _KEY.fullmatch(key) and vz.Ed25519PublicKey.from_base64(key)
+        except vz.KeyException:
             ok = False
         if not ok:
             raise PinsError(f"{source}:{n}: {key!r} is not an unpadded base64 Ed25519 key")

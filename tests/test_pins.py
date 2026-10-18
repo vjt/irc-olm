@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from irc_olm.pins import PinsError, load_pins, parse_pins, pins_writable
@@ -29,3 +27,13 @@ def test_load_and_writability(tmp_path):
     p.write_text(f"vjt {KEY}\n")
     assert load_pins(p) == {"vjt": KEY}
     assert pins_writable(p)          # ours, in a directory we own: the warning case
+
+
+def test_parse_pins_refuses_a_key_with_non_canonical_trailing_bits():
+    import base64
+    raw = base64.b64decode(KEY + "=")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    alt = next(KEY[:-1] + c for c in alphabet
+               if c != KEY[-1] and base64.b64decode(KEY[:-1] + c + "=") == raw)
+    with pytest.raises(PinsError):
+        parse_pins(f"vjt {alt}\n")

@@ -76,3 +76,12 @@ def test_no_challenge_to_an_unpinned_nick(net):
     bot, vjt = establish(net)
     with pytest.raises(NotPinnedError):
         bot.challenge("nobody", network="TestNet", channel="#x", sender_mask="m", line=b"x")
+
+
+def test_ack_after_expiry_without_a_tick_is_rejected_as_expired(net):
+    bot, vjt = establish(net)
+    ch = chal(net, bot)
+    net.take("vjt")
+    net.clock.t += CHALLENGE_TTL + 1
+    net.pump("vjt", vjt.send("bot", {"t": "ack", "nonce": ch.nonce}))
+    assert [e.reason for e in net.take("bot", AckRejected)] == ["expired"]
