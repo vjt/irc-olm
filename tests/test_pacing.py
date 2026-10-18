@@ -141,3 +141,30 @@ def test_submit_all_keeps_order_per_target():
     assert done.wait(5)
     assert [x for x in got if x[0] == "a"] == [("a", "a1"), ("a", "a2")]
     assert [x for x in got if x[0] == "b"] == [("b", "b1"), ("b", "b2")]
+
+
+def test_paced_sender_survives_a_send_that_raises():
+    import threading
+    from irc_olm.pacing import PacedSender
+
+    got, done = [], threading.Event()
+
+    def send(target, line):
+        if line == "boom":
+            raise OSError("socket gone")
+        got.append(line)
+        if line == "after":
+            done.set()
+
+    s = PacedSender(send, Pacer(max_lines=3, window=0.1))
+    s.submit("vjt", ["boom", "after"])
+    assert done.wait(2)
+    assert got == ["after"]
+
+
+def test_pacer_refuses_a_whole_batch_past_its_per_target_cap():
+    p = Pacer(max_lines=3, window=6.0, max_queue=4)
+    assert p.submit("vjt", ["1", "2", "3"]) is True
+    assert p.submit("vjt", ["4", "5"]) is False
+    assert p.pending() == 3
+    assert p.submit("other", ["a", "b", "c", "d"]) is True
