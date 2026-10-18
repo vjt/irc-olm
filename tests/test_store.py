@@ -97,3 +97,11 @@ def test_load_refuses_a_world_readable_state(tmp_path):
     os.chmod(tmp_path / "s.json", 0o644)
     with pytest.raises(store.InsecureFileError):
         s.load()
+
+
+def test_state_round_trips_a_lone_surrogate_whatever_the_locale(tmp_path):
+    # A caller decoding IRC with surrogateescape can hand us such a nick.
+    f = store.StateFile(tmp_path / "s.json")
+    f.save({"nick": "vjt\udcff", "x": "é"})
+    assert f.load() == {"nick": "vjt\udcff", "x": "é"}
+    assert (tmp_path / "s.json").read_bytes().isascii()

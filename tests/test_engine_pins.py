@@ -234,3 +234,176 @@ def test_what_was_queued_for_a_replaced_key_never_goes_to_the_new_one(net, tmp_p
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "for the new key"}))
     assert texts(net.take("vjt")) == ["for the new key"]
     assert [(e.reason, e.lost) for e in net.take("bot", SendFailed)] == [("key-mismatch", 1)]
+
+
+def _keys(signer, curve, otk):
+    from irc_olm.engine import OTK_SIG_PREFIX
+    return {"v": 1, "id": _claim(signer, curve),
+            "otk": {"key": otk, "fallback": True, "sig": signer._sign(OTK_SIG_PREFIX + otk)}}
+
+
+def test_a_pinned_key_claiming_our_own_curve_is_refused(net):
+    # Else it could hand us our own fallback key as its one-time key and
+    # reflect our own PKMSG back to us as its message.
+    bot, eve = net.add("bot"), net.add("eve")
+    net.pin("bot", "eve")
+    bot.send("eve", {"t": "text", "body": "for eve"})
+    res = net.inject("eve", "bot", "KEYS", _keys(eve, bot.identity["curve25519"],
+                                                 bot._fallback["key"]))
+    assert "own-identity" in [e.reason for e in res.events if isinstance(e, Dropped)]
+    assert [(e.reason, e.lost) for e in res.events if isinstance(e, SendFailed)] == \
+        [("key-mismatch", 1)]
+    assert res.outbound == []
+    assert {p.ed25519: p.curve25519 for p in bot.peers()}[eve.fingerprint] is None
+
+
+def test_our_own_key_in_the_pins_is_never_a_peer(net):
+    bot = net.add("bot")
+    net.add("vjt")
+    net.pair("bot", "vjt")
+    chat(net, "vjt", "bot", "hi")
+    (pk,) = net.captured("PKMSG", "vjt")
+    net.pins["bot"]["me"] = bot.fingerprint
+    bot.set_pins(net.pins["bot"])
+    res = net.inject("me", "bot", "PKMSG", {**pk, "id": bot.identity})
+    assert texts(res.events) == []
+    assert "own-identity" in [e.reason for e in res.events if isinstance(e, Dropped)]
+
+
+def test_a_curve_claimed_through_keys_never_locks_its_owner_out(net):
+    import vodozemac as vz
+    bot, vjt, eve = net.add("bot"), net.add("vjt"), net.add("eve")
+    net.pair("bot", "vjt")
+    net.pin("bot", "eve")
+    bot.send("eve", {"t": "text", "body": "for eve"})        # KEYREQ to eve
+    # eve answers claiming vjt's curve (public), before vjt ever talked
+    junk = vz.Account().curve25519_key.to_base64()
+    net.inject("eve", "bot", "KEYS", _keys(eve, vjt.identity["curve25519"], junk))
+    chat(net, "vjt", "bot", "the real vjt")
+    (got,) = [e for e in net.take("bot") if isinstance(e, Received)]
+    assert got.peer.ed25519 == vjt.fingerprint
+    bound = {p.ed25519: p.curve25519 for p in bot.peers()}
+    assert bound[vjt.fingerprint] == vjt.identity["curve25519"]
+    assert bound[eve.fingerprint] is None                    # the claim is gone
+    bot2 = net.restart("bot")
+    chat(net, "bot", "vjt", "after a restart")
+    assert texts(net.take("vjt")) == ["after a restart"]
+    assert bot2.pinned("vjt").curve25519 == vjt.identity["curve25519"]
+
+
+def test_keys_cannot_claim_a_curve_another_key_already_claimed(net):
+    import vodozemac as vz
+    bot, vjt, eve = net.add("bot"), net.add("vjt"), net.add("eve")
+    net.pin("bot", "vjt")
+    net.pin("bot", "eve")
+    bot.send("vjt", {"t": "text", "body": "for vjt"})
+    bot.send("eve", {"t": "text", "body": "for eve"})
+    curve = vz.Account().curve25519_key.to_base64()
+    junk = vz.Account().curve25519_key.to_base64()
+    net.inject("vjt", "bot", "KEYS", _keys(vjt, curve, junk))
+    res = net.inject("eve", "bot", "KEYS", _keys(eve, curve, junk))
+    assert "curve-already-bound" in [e.reason for e in res.events if isinstance(e, Dropped)]
+    assert res.outbound == []
+
+
+def _as_nick(net, src, as_nick, dst, result):
+    """`src` speaks to `dst` from the nick `as_nick`, until the wire is quiet."""
+    events, queue = [], [("up", result)]
+    while queue:
+        way, r = queue.pop(0)
+        for _, body in r.outbound:
+            if way == "up":
+                rr = net.engines[dst].receive(as_nick, body)
+                events += rr.events
+                queue.append(("down", rr))
+            else:
+                queue.append(("up", net.engines[src].receive(dst, body)))
+    return events
+
+
+def test_a_nick_hint_belongs_to_the_key_that_spoke_from_it_last(net):
+    bot, a, c = net.add("bot"), net.add("a"), net.add("c")
+    net.pair("bot", "a")
+    net.pair("bot", "c")
+    chat(net, "a", "bot", "a1")
+    chat(net, "c", "bot", "c1")
+    _as_nick(net, "a", "x", "bot", a.send("bot", {"t": "text", "body": "a from x"}))
+    _as_nick(net, "c", "x", "bot", c.send("bot", {"t": "text", "body": "c from x"}))
+    assert bot.pinned("x").ed25519 == c.fingerprint
+    assert bot.pinned("a").ed25519 == a.fingerprint          # a is back to its own nick
+
+
+def test_lines_carrying_a_pinned_key_from_an_unmapped_nick_get_no_nack(net):
+    net.add("bot")
+    vjt = net.add("vjt")
+    net.pair("bot", "vjt")
+    chat(net, "vjt", "bot", "hi")
+    chat(net, "bot", "vjt", "hello")
+    (pk,) = net.captured("PKMSG", "vjt")
+    (msg,) = net.captured("MSG", "bot")
+    for nick in ("mallory1", "mallory2"):
+        replay = net.inject(nick, "bot", "PKMSG", pk)
+        forged = net.inject(nick, "bot", "MSG", {**msg, "ck": vjt.identity["curve25519"]})
+        assert replay.outbound == [] and forged.outbound == []
+
+
+@pytest.mark.parametrize("verb", ["PKMSG", "KEYS"])
+def test_an_ed25519_key_of_33_bytes_is_dropped_not_a_panic(net, verb):
+    # vodozemac 0.10 panics on it, and a PanicException is a BaseException.
+    import base64
+    bot = net.add("bot")
+    ed = base64.b64encode(bytes(33)).decode()
+    ident = {"ed25519": ed, "curve25519": "A", "sig": "A"}
+    if verb == "KEYS":
+        net.add("vjt")
+        net.pin("bot", "vjt")
+        bot.send("vjt", {"t": "text", "body": "x"})
+        payload = {"v": 1, "id": ident, "otk": {"key": "A", "fallback": True, "sig": "A"}}
+    else:
+        payload = {"v": 1, "id": ident, "body": "A"}
+    res = net.inject("vjt" if verb == "KEYS" else "mallory", "bot", verb, payload)
+    assert [e for e in res.events if isinstance(e, Dropped)]
+
+
+def test_a_pinned_key_of_33_bytes_is_a_value_error(net):
+    import base64
+    bot = net.add("bot")
+    with pytest.raises(ValueError):
+        bot.set_pins({"vjt": base64.b64encode(bytes(33)).decode()})
+
+
+def test_a_panic_from_vodozemac_on_wire_input_is_a_drop(net, monkeypatch):
+    import vodozemac as vz
+    PanicException = type("PanicException", (BaseException,), {})
+    bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
+    msg = vjt.send("bot", {"t": "text", "body": "x"})        # KEYREQ
+    keys = bot.receive("vjt", msg.outbound[0][1])
+
+    def panic(*a):
+        raise PanicException("copy_from_slice")
+    monkeypatch.setattr(vz.Account, "create_outbound_session", panic, raising=False)
+    from irc_olm.engine import Result
+    res = Result()
+    for _, body in keys.outbound:
+        res.extend(vjt.receive("bot", body))
+    assert "bad-payload:PanicException" in [e.reason for e in res.events if isinstance(e, Dropped)]
+
+
+def test_a_curve_is_proven_by_a_decrypt_and_stays_proven_across_a_restart(net):
+    import json
+
+    def proven(engine):
+        doc = json.loads(engine.state_path.read_text())
+        return doc["peers"][net.engines["vjt"].fingerprint]["proven"]
+
+    bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
+    net.drop = lambda src, dst, body: src == "vjt" and framing.parse(body).verb == "MSG"
+    chat(net, "bot", "vjt", "hello")          # KEYREQ, KEYS: our session, a claim
+    assert proven(bot) is False
+    net.drop = None
+    chat(net, "vjt", "bot", "hi back")        # a MSG decrypts on it: proven
+    assert proven(bot) is True
+    net.restart("bot").set_pins(net.pins["bot"])
+    assert proven(bot) is True

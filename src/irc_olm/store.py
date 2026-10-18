@@ -69,7 +69,10 @@ class StateFile:
         return json.loads(self.path.read_text())
 
     def save(self, doc: dict) -> None:
-        data = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))  # raises before any I/O
+        # ASCII, whatever the locale: a lone surrogate (a nick decoded with
+        # surrogateescape) is written as \udcxx instead of failing every
+        # save from then on.
+        data = json.dumps(doc, separators=(",", ":"))  # raises before any I/O
         fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w") as f:

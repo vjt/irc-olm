@@ -48,10 +48,11 @@ KEYS_INTERVAL = 10.0         # at most one KEYS answer per nick in this long
 OUTQ_TTL = 60.0              # queued plaintext waiting for keys
 OUTQ_MAX = 16
 REKEY_INTERVAL = 60.0        # spec: at most one new session per peer per minute
-NACK_INTERVAL = 10.0         # at most one NACK per nick in this long
 OTK_PER_NICK_INTERVAL = 60.0 # one one-time key per nick per minute, else the fallback
 OTK_GLOBAL_PER_HOUR = 30
 SENT_MEMORY = 120.0          # plaintexts kept for a re-send after a NACK
+MAX_SENDS = 2                # a message goes out at most twice: once, and once
+                             # more on a fresh session after a NACK
 MAX_SESSIONS_PER_PEER = 5
 SEEN_SESSIONS_MAX = 10_000
 FALLBACK_ROTATE = 7 * 86400  # vodozemac keeps the previous one: a fallback key
@@ -74,10 +75,19 @@ def unb64u(text: str) -> bytes:
     return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
 
 
+def ed25519_key(key: str) -> vz.Ed25519PublicKey:
+    """An Ed25519 key from base64. Raises ValueError on a malformed one.
+    vodozemac 0.10 PANICS on a key of 33 bytes, and pyo3 raises that as a
+    PanicException, a BaseException: it never sees anything but 32."""
+    if len(unb64u(key)) != 32:
+        raise ValueError("an Ed25519 key is 32 bytes")
+    return vz.Ed25519PublicKey.from_base64(key)
+
+
 def canonical_ed25519(key: str) -> str:
     """The one spelling of an Ed25519 key (vodozemac's unpadded to_base64()).
-    Raises vodozemac.KeyException (a ValueError) on a malformed key."""
-    return vz.Ed25519PublicKey.from_base64(key).to_base64()
+    Raises ValueError on a malformed key."""
+    return ed25519_key(key).to_base64()
 
 
 def canonical_curve25519(key: str) -> str:
@@ -195,6 +205,7 @@ class _Queued:
     ed25519: str     # the key it was meant for: it never goes to another one
     plaintext: bytes = field(repr=False)
     at: float
+    sends: int       # 1 for a first send, 2 for a re-send after a NACK
 
 
 @dataclass
@@ -204,6 +215,7 @@ class _Sent:
     session_id: str
     plaintext: bytes = field(repr=False)
     at: float
+    sends: int
 
 
 class Engine:
@@ -224,6 +236,7 @@ class Engine:
         self._reasm = Reassembler(clock=clock)
 
         self._peers: dict[str, Peer] = {}            # ed25519 -> Peer (pinned only)
+        self._proven: set[str] = set()               # ed25519 whose curve a decrypt proved
         self._pins: dict[str, str] = {}              # folded nick -> ed25519, from config
         self._sessions: dict[str, list[vz.Session]] = {}  # curve25519 -> newest first
         self._seen: OrderedDict[str, None] = OrderedDict()
@@ -231,10 +244,8 @@ class Engine:
 
         self._outq: dict[str, list[_Queued]] = {}    # folded nick -> plaintexts
         self._keyreq_at: dict[str, float] = {}       # folded nick -> last KEYREQ
-        self._keyreq_for: dict[str, str] = {}        # folded nick -> ed25519 asked for
         self._keys_at: dict[str, float] = {}         # folded nick -> last KEYS answer
         self._rekey_at: dict[str, float] = {}        # ed25519 -> last new outbound session
-        self._nack_at: dict[str, float] = {}         # folded nick -> last NACK sent
         self._otk_at: dict[str, float] = {}          # folded nick -> last OTK handed out
         self._otk_log: list[float] = []
         self._sent: OrderedDict[str, _Sent] = OrderedDict()
@@ -280,6 +291,7 @@ class Engine:
                 if ed not in keep:
                     curve = self._peers.pop(ed).curve25519
                     self._sessions.pop(curve, None)
+                    self._proven.discard(ed)
             for nick, ed in new.items():
                 if ed not in self._peers:
                     self._peers[ed] = Peer(ed, None, nick)
@@ -322,24 +334,24 @@ class Engine:
             except (TypeError, ValueError):
                 res.events.append(SendFailed(nick, "unencodable", 1))
                 return res
-            self._send_to(nick, peer, plaintext, res)
+            self._send_to(nick, peer, plaintext, 1, res)
             return res
 
-    def _send_to(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
+    def _send_to(self, nick: str, peer: Peer, plaintext: bytes, sends: int, res: Result) -> None:
         # While keys are asked for (first contact, or a re-key after a NACK)
         # the sessions we still hold are the ones that failed: wait.
         if self._sessions.get(peer.curve25519) and fold(nick) not in self._keyreq_at:
-            self._encrypt(nick, peer, plaintext, res)
+            self._encrypt(nick, peer, plaintext, sends, res)
         else:
-            self._enqueue(nick, peer, plaintext, res)
+            self._enqueue(nick, peer, plaintext, sends, res)
 
-    def _enqueue(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
+    def _enqueue(self, nick: str, peer: Peer, plaintext: bytes, sends: int, res: Result) -> None:
         key = fold(nick)
         q = self._live_queue(key, res)
         if len(q) >= OUTQ_MAX:
             res.events.append(SendFailed(nick, "queue-full", 1))
             return
-        q.append(_Queued(nick, peer.ed25519, plaintext, self._now()))
+        q.append(_Queued(nick, peer.ed25519, plaintext, self._now(), sends))
         self._outq[key] = q
         res.events.append(SendQueued(nick, len(q)))
         self._maybe_keyreq(nick, peer, res)
@@ -360,10 +372,10 @@ class Engine:
         if last is not None and self._now() - last < KEYREQ_RETRY:
             return
         self._keyreq_at[key] = self._now()
-        self._keyreq_for[key] = peer.ed25519
         self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res)
 
-    def _encrypt(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
+    def _encrypt(self, nick: str, peer: Peer, plaintext: bytes, sends: int,
+                 res: Result) -> None:
         session = self._sessions[peer.curve25519][0]
         msg = session.encrypt(plaintext)
         mtype, ct = msg.to_parts()
@@ -373,8 +385,15 @@ class Engine:
             verb, payload = "MSG", {"v": WIRE_VERSION, "ck": self.identity["curve25519"],
                                     "body": b64u(ct)}
         self._save()
-        msgid = self._emit(nick, verb, payload, res)
-        self._sent[msgid] = _Sent(fold(nick), peer.ed25519, session.session_id, plaintext, self._now())
+        try:
+            msgid = self._emit(nick, verb, payload, res)
+        except PayloadError:
+            # More than 64 fragments. The session has moved on by one
+            # message, which the peer's Olm skips over.
+            res.events.append(SendFailed(nick, "too-long", 1))
+            return
+        self._sent[msgid] = _Sent(nick, peer.ed25519, session.session_id, plaintext,
+                                  self._now(), sends)
         self._trim_sent()
 
     def _emit(self, nick: str, verb: str, payload: dict, res: Result) -> str:
@@ -414,6 +433,13 @@ class Engine:
                 # A payload missing a field, or a key that does not decode:
                 # malformed input from the wire, never a reason to crash.
                 res.events.append(Dropped(nick, f"bad-payload:{type(e).__name__}", done.verb))
+            except BaseException as e:
+                # vodozemac panicking on some input it should have refused:
+                # pyo3 raises a PanicException, a BaseException no one can
+                # import. Wire input again, so a drop; nothing else is.
+                if type(e).__name__ != "PanicException":
+                    raise
+                res.events.append(Dropped(nick, "bad-payload:PanicException", done.verb))
             return res
 
     def _on_keyreq(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
@@ -452,34 +478,28 @@ class Engine:
         if not self._sig_ok(payload["id"]["ed25519"], OTK_SIG_PREFIX + otk["key"], otk["sig"]):
             res.events.append(Dropped(nick, "bad-otk-signature", "KEYS"))
             return
-        peer = self._identify(nick, payload["id"], res)
-        if peer is None or peer.ed25519 != self._keyreq_for.get(key):
-            # Not the identity we asked this nick for: what we queued was
-            # meant for that one, never for this one.
-            self._keyreq_at.pop(key, None)
-            lost = len(self._outq.pop(key, []))
-            res.events.append(SendFailed(nick, "key-mismatch", lost))
+        peer = self._identify(nick, payload["id"], res, proving=False)
+        del self._keyreq_at[key]
+        queue = self._live_queue(key, res)
+        self._outq.pop(key, None)
+        # Each queued message goes to the key it was meant for, or nowhere:
+        # the nick may have been re-pinned since it was queued.
+        mine = [q for q in queue if peer is not None and q.ed25519 == peer.ed25519]
+        if len(mine) < len(queue):
+            res.events.append(SendFailed(nick, "key-mismatch", len(queue) - len(mine)))
+        if not mine:
             return
         session = self._account.create_outbound_session(
             vz.Curve25519PublicKey.from_base64(peer.curve25519),
             vz.Curve25519PublicKey.from_base64(otk["key"]))
-        del self._keyreq_at[key]
-        self._bind(peer)
+        self._bind(peer, proven=False)
         self._add_session(peer.curve25519, session)
         self._rekey_at[peer.ed25519] = self._now()
-        self._save()
-        lost = 0
-        for q in self._live_queue(key, res):
-            if q.ed25519 == peer.ed25519:
-                self._encrypt(nick, peer, q.plaintext, res)
-            else:
-                lost += 1   # queued for a key the operator has since replaced
-        self._outq.pop(key, None)
-        if lost:
-            res.events.append(SendFailed(nick, "key-mismatch", lost))
+        for q in mine:
+            self._encrypt(nick, peer, q.plaintext, q.sends, res)
 
     def _on_pkmsg(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
-        peer = self._identify(nick, payload["id"], res)
+        peer = self._identify(nick, payload["id"], res, proving=True)
         if peer is None:
             return
         any_msg = vz.AnyOlmMessage.from_parts(0, unb64u(payload["body"]))
@@ -496,33 +516,34 @@ class Engine:
             # second case recovers. A replayer only gets a NACK back for a
             # msgid that is not its own.
             res.events.append(Replayed(nick, sid))
-            return self._undecryptable(nick, msg.msgid, "replayed-session", res)
+            return self._undecryptable(nick, msg.msgid, "replayed-session", peer, res)
         try:
             session, plaintext = self._account.create_inbound_session(
                 vz.Curve25519PublicKey.from_base64(peer.curve25519), pre)
         except vz.SessionCreationException as e:
-            return self._undecryptable(nick, msg.msgid, f"session-creation:{e}", res)
+            return self._undecryptable(nick, msg.msgid, f"session-creation:{e}", peer, res)
         self._seen[sid] = None
         while len(self._seen) > SEEN_SESSIONS_MAX:
             self._seen.popitem(last=False)
-        self._bind(peer)
+        self._bind(peer, proven=True)
         self._add_session(peer.curve25519, session)
         self._touch(peer, nick)
         self._save()
         self._deliver(nick, peer, plaintext, res)
 
     def _on_msg(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
-        ck = canonical_curve25519(payload["ck"])
-        peer = next((p for p in self._peers.values() if p.curve25519 == ck), None)
-        if peer is None:
-            if self.pinned(nick) is None:
+        owner = self._curve_owner(canonical_curve25519(payload["ck"]))
+        if owner is None:
+            mapped = self.pinned(nick)
+            if mapped is None:
                 res.events.append(Dropped(nick, "unpinned-key", "MSG"))
                 return
             # A pinned nick whose key we never saw a session for (our state
             # was lost?): a NACK makes it open a fresh one, with its id block.
-            return self._undecryptable(nick, msg.msgid, "no-session", res)
+            return self._undecryptable(nick, msg.msgid, "no-session", mapped, res)
+        peer = self._peers[owner]
         if not self._sessions.get(peer.curve25519):
-            return self._undecryptable(nick, msg.msgid, "no-session", res)
+            return self._undecryptable(nick, msg.msgid, "no-session", peer, res)
         # Nothing about the peer moves before a decrypt succeeds: `ck` is
         # public, and anyone can put it on a line.
         any_msg = vz.AnyOlmMessage.from_parts(1, unb64u(payload["body"]))
@@ -531,19 +552,20 @@ class Engine:
                 return self._decrypted(nick, peer, msg, s, any_msg, res)
             except vz.OlmDecryptionException:
                 continue
-        self._undecryptable(nick, msg.msgid, "decryption-failed", res)
+        self._undecryptable(nick, msg.msgid, "decryption-failed", peer, res)
 
     def _decrypted(self, nick, peer, msg, session, any_msg, res) -> None:
         try:
             plaintext = session.decrypt(any_msg)
         except vz.OlmDecryptionException:
             if msg.verb == "PKMSG":
-                return self._undecryptable(nick, msg.msgid, "decryption-failed", res)
+                return self._undecryptable(nick, msg.msgid, "decryption-failed", peer, res)
             raise
         # The session the peer just used is the one to answer on.
         lst = self._sessions[peer.curve25519]
         lst.remove(session)
         lst.insert(0, session)
+        self._bind(peer, proven=True)
         self._touch(peer, nick)
         self._save()
         self._deliver(nick, peer, plaintext, res)
@@ -565,44 +587,59 @@ class Engine:
 
     def _on_nack(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         self._trim_sent()
-        sent = self._sent.get(payload["ref"])
-        if sent is None or sent.nick != fold(nick):
+        sent = self._sent.pop(payload["ref"], None)
+        if sent is None:
             res.events.append(Dropped(nick, "unknown-nack-ref", "NACK"))
             return
-        del self._sent[payload["ref"]]
         peer = self._peers.get(sent.ed25519)
+        if fold(sent.nick) != fold(nick):
+            # NACKs are not authenticated: never re-send on the word of a
+            # nick we did not send to. The recipient renamed, most likely.
+            res.events.append(SendFailed(sent.nick, "nack-from-another-nick", 1))
+            return
         if peer is None:
             res.events.append(SendFailed(nick, "unpinned-key", 1))
             return
-        lst = self._sessions.get(peer.curve25519, [])
-        rest = [s for s in lst if s.session_id != sent.session_id]
-        if lst and lst[0].session_id != sent.session_id:
-            # A newer session than the failed one exists (a re-key since, or
-            # one the peer has used since): re-send there, no new session.
-            self._sessions[peer.curve25519] = rest
-            self._save()
-            return self._send_to(nick, peer, sent.plaintext, res)
+        if not self._reached_at(nick, peer):
+            res.events.append(SendFailed(nick, "repinned", 1))
+            return
+        if sent.sends >= MAX_SENDS:
+            res.events.append(SendFailed(nick, "resend-failed", 1))
+            return
+        lst = self._sessions.get(peer.curve25519) or []
+        if lst and lst[0].session_id != sent.session_id or fold(nick) in self._keyreq_at:
+            # The failed session is not our newest, or keys are already asked
+            # for (a re-key for an earlier NACK of the same burst, say): re-send
+            # on the newest, or queue behind the keys. No new session.
+            self._drop_session(peer.curve25519, sent.session_id)
+            return self._send_to(nick, peer, sent.plaintext, sent.sends + 1, res)
         # The failed session is our newest: only a new one helps, and the
         # spec allows one per peer per minute.
         last = self._rekey_at.get(peer.ed25519)
         if last is not None and self._now() - last < REKEY_INTERVAL:
             res.events.append(SendFailed(nick, "rekey-throttled", 1))
             return
-        self._sessions[peer.curve25519] = rest
-        self._save()
+        self._drop_session(peer.curve25519, sent.session_id)
         res.events.append(Rekeying(nick, peer))
         # Re-send the lost message on the new session (the spec's MAY).
         self._keyreq_at.pop(fold(nick), None)
-        self._enqueue(nick, peer, sent.plaintext, res)
+        self._enqueue(nick, peer, sent.plaintext, sent.sends + 1, res)
 
-    def _undecryptable(self, nick: str, msgid: str, reason: str, res: Result) -> None:
+    def _undecryptable(self, nick: str, msgid: str, reason: str, peer: Peer,
+                       res: Result) -> None:
+        """Report it, and NACK when `nick` is where `peer`, the key the line
+        claims, is reached: a pinned key's curve and id block are public, and
+        anyone can put them on a line. Every such message gets its own NACK,
+        one line out per message in: the sender re-sends what is NACKed, and
+        a message without a NACK is lost without a word."""
         res.events.append(Undecryptable(nick, msgid, reason))
-        key, now = fold(nick), self._now()
-        last = self._nack_at.get(key)
-        if last is not None and now - last < NACK_INTERVAL:
-            return
-        self._nack_at[key] = now
-        self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res)
+        if self._reached_at(nick, peer):
+            self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res)
+
+    def _reached_at(self, nick: str, peer: Peer) -> bool:
+        """Whether sending to `nick` reaches `peer`'s key."""
+        mapped = self.pinned(nick)
+        return mapped is not None and mapped.ed25519 == peer.ed25519
 
     # --- order challenges ---------------------------------------------------
 
@@ -644,22 +681,30 @@ class Engine:
 
     # --- identities and pins -------------------------------------------------
 
-    def _identify(self, nick: str, ident: dict, res: Result) -> Peer | None:
+    def _identify(self, nick: str, ident: dict, res: Result, *, proving: bool) -> Peer | None:
         """The pinned peer behind a presented id block, with the presented
-        curve filled in but NOT stored, or None: a bad signature, a key
-        nobody pinned (ignored, never answered), or a curve that belongs to
-        another key.
+        curve filled in but NOT stored, or None: a bad signature, our own
+        identity, a key nobody pinned (ignored, never answered), or a curve
+        that belongs to another key.
 
         An id block is public and replayable, and its signature only says the
         Ed25519 key CLAIMS that curve, not that it holds it. So the caller
-        stores the curve (_bind) and moves the nick hint (_touch) only once a
-        session exists: one we opened on keys we asked for, or one whose
-        first message decrypted."""
+        stores the curve (_bind) only once a session exists, and moves the
+        nick hint (_touch) only once a message decrypted. A session we opened
+        on keys we asked for proves nothing yet: until a decrypt does, the
+        curve is a claim, and `proving` (a pre-key message about to be
+        decrypted) may take it from another key that only claimed it."""
         if not self._sig_ok(ident["ed25519"], ID_SIG_PREFIX + ident["curve25519"], ident["sig"]):
             res.events.append(Dropped(nick, "bad-identity-signature"))
             return None
         ed = canonical_ed25519(ident["ed25519"])
         curve = canonical_curve25519(ident["curve25519"])
+        if curve == self._account.curve25519_key.to_base64():
+            # Else a pinned key could claim our curve, hand us our own
+            # fallback key as its one-time key, and reflect our own messages
+            # back to us as its own. (Our own key cannot sign another curve.)
+            res.events.append(Dropped(nick, "own-identity"))
+            return None
         peer = self._peers.get(ed)
         if peer is None:
             pinned_ed = self._pins.get(fold(nick))
@@ -670,24 +715,40 @@ class Engine:
         if peer.curve25519 is not None and peer.curve25519 != curve:
             res.events.append(Dropped(nick, "identity-curve-mismatch"))
             return None
-        if any(p.curve25519 == curve for p in self._peers.values() if p.ed25519 != ed):
+        owner = self._curve_owner(curve)
+        if owner not in (None, ed) and (owner in self._proven or not proving):
             # One curve under two keys would let one peer's messages be
             # read as the other's (sessions and MSG lookups go by curve).
             res.events.append(Dropped(nick, "curve-already-bound"))
             return None
         return replace(peer, curve25519=curve)
 
-    def _bind(self, peer: Peer) -> None:
+    def _curve_owner(self, curve: str | None) -> str | None:
+        if curve is None:
+            return None
+        return next((ed for ed, p in self._peers.items() if p.curve25519 == curve), None)
+
+    def _bind(self, peer: Peer, *, proven: bool) -> None:
+        """Store the curve a session was opened on; `proven` once a message
+        decrypted on it. A proof evicts another key's claim on that curve,
+        sessions included (_identify let it through only if unproven)."""
+        owner = self._curve_owner(peer.curve25519)
+        if owner not in (None, peer.ed25519):
+            self._peers[owner] = replace(self._peers[owner], curve25519=None)
+            self._sessions.pop(peer.curve25519, None)
         cur = self._peers[peer.ed25519]
         if cur.curve25519 is None:
             self._peers[peer.ed25519] = replace(cur, curve25519=peer.curve25519)
-            self._save()
+        if proven:
+            self._proven.add(peer.ed25519)
 
     def _touch(self, peer: Peer, nick: str) -> None:
-        cur = self._peers[peer.ed25519]
-        if cur.nick != nick:
-            self._peers[peer.ed25519] = replace(cur, nick=nick)
-            self._save()
+        """The nick hint follows the key that just spoke. A hint names one
+        key: any other key last seen there is back at its configured nick."""
+        for ed, p in list(self._peers.items()):
+            if ed != peer.ed25519 and fold(p.nick) == fold(nick):
+                self._peers[ed] = replace(p, nick=next(n for n, e in self._pins.items() if e == ed))
+        self._peers[peer.ed25519] = replace(self._peers[peer.ed25519], nick=nick)
 
     # --- crypto helpers ------------------------------------------------------
 
@@ -697,7 +758,7 @@ class Engine:
     @staticmethod
     def _sig_ok(ed25519: str, text: str, sig: str) -> bool:
         try:
-            vz.Ed25519PublicKey.from_base64(ed25519).verify_signature(
+            ed25519_key(ed25519).verify_signature(
                 text.encode(), vz.Ed25519Signature.from_base64(sig))
         except (vz.KeyException, vz.SignatureException, vz.DecodeException, ValueError):
             return False
@@ -709,6 +770,14 @@ class Engine:
         self._account.mark_keys_as_published()
         key = fb.to_base64()
         self._fallback = {"key": key, "sig": self._sign(OTK_SIG_PREFIX + key), "at": self._now()}
+
+    def _drop_session(self, curve: str | None, session_id: str) -> None:
+        rest = [s for s in self._sessions.get(curve, []) if s.session_id != session_id]
+        if rest:
+            self._sessions[curve] = rest
+        else:
+            self._sessions.pop(curve, None)
+        self._save()
 
     def _add_session(self, curve: str, session: vz.Session) -> None:
         lst = self._sessions.setdefault(curve, [])
@@ -735,7 +804,8 @@ class Engine:
                          "curve25519": self._account.curve25519_key.to_base64()},
             "account": self._account.pickle(self._key),
             "fallback": self._fallback,
-            "peers": {ed: {"curve25519": p.curve25519, "nick": p.nick}
+            "peers": {ed: {"curve25519": p.curve25519, "nick": p.nick,
+                           "proven": ed in self._proven}
                       for ed, p in self._peers.items()},
             "sessions": {c: [s.pickle(self._key) for s in lst] for c, lst in self._sessions.items()},
             "seen_sessions": list(self._seen),
@@ -750,6 +820,7 @@ class Engine:
         self._account = vz.Account.from_pickle(doc["account"], self._key)
         self._fallback = doc["fallback"]
         self._peers = {ed: Peer(ed, p["curve25519"], p["nick"]) for ed, p in doc["peers"].items()}
+        self._proven = {ed for ed, p in doc["peers"].items() if p["proven"]}
         self._sessions = {c: [vz.Session.from_pickle(s, self._key) for s in lst]
                           for c, lst in doc["sessions"].items()}
         self._seen = OrderedDict((sid, None) for sid in doc["seen_sessions"])
