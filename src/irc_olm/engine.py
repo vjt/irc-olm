@@ -60,7 +60,7 @@ SENT_MAX = 1200              # and at most this many: what the bank lets out in
                              # SENT_MEMORY (2 s a line at least) plus a backlog
 MAX_SENDS = 2                # a message goes out at most twice: once, and once
                              # more on a fresh session after a NACK
-URGENT_INNER = ("chal", "ack")  # inner types that must not wait behind text
+URGENT_INNER = ("chal", "ack")  # inner types that may go ahead of text
 MAX_SESSIONS_PER_PEER = 5
 SEEN_SESSIONS_MAX = 10_000
 FALLBACK_ROTATE = 7 * 86400  # vodozemac keeps the previous one: a fallback key
@@ -199,10 +199,11 @@ class Result:
     events: list = field(default_factory=list)
     outbound: list[tuple[str, str]] = field(default_factory=list)
     # msgid -> seconds it stays useful (None: no deadline), for the outbound
-    # messages that must not wait behind text: the KEYREQ/KEYS/NACK of the
-    # protocol (the pacer budgets KEYS and NACK, which a peer draws), and the
-    # messages carrying a CHAL or an ACK. A CHAL carries what is left of its
-    # 15 s; the pacer drops it unsent past that.
+    # messages that may go ahead of text: the KEYREQ/KEYS/NACK of the
+    # protocol (the pacer budgets KEYS and NACK by their verb, a peer draws
+    # them), and the messages carrying a CHAL or an ACK. A CHAL carries what
+    # is left of its 15 s: the pacer starts it only while an ACK can still
+    # make it back in time.
     urgent: dict[str, float | None] = field(default_factory=dict)
 
     def extend(self, other: "Result") -> "Result":
@@ -403,22 +404,26 @@ class Engine:
         ttl = None if msg.expires is None else msg.expires - self._now()
         if ttl is not None and ttl <= 0:
             return          # a CHAL that expired waiting for keys: ChallengeExpired says so
-        session = self._sessions[peer.curve25519][0]
-        mtype, ct = session.encrypt(msg.plaintext).to_parts()
+        sessions = self._sessions[peer.curve25519]
+        before = sessions[0].pickle(self._key)
+        mtype, ct = sessions[0].encrypt(msg.plaintext).to_parts()
         if mtype == 0:
             verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self.identity, "body": b64u(ct)}
         else:
             verb, payload = "MSG", {"v": WIRE_VERSION, "ck": self.identity["curve25519"],
                                     "body": b64u(ct)}
-        self._save()
         try:
             msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent, ttl=ttl)
         except PayloadError:
-            # More than 64 fragments. The session has moved on by one
-            # message, which the peer's Olm skips over.
+            # More than 64 fragments: the session goes back to where it was,
+            # leaving the peer no message key to skip (past 40 skipped, Olm
+            # forgets the oldest, and the messages still on their way with
+            # them). Nothing was saved, and nothing leaves.
+            sessions[0] = vz.Session.from_pickle(before, self._key)
             res.events.append(SendFailed(nick, "too-long", 1))
             return
-        self._sent[msgid] = _Sent(nick, peer.ed25519, session.session_id, msg, self._now())
+        self._save()        # before any of it leaves: the caller sends it
+        self._sent[msgid] = _Sent(nick, peer.ed25519, sessions[0].session_id, msg, self._now())
         self._trim_sent()
 
     def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, urgent: bool,

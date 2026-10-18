@@ -347,6 +347,28 @@ def test_a_message_too_long_for_64_fragments_is_a_send_failure(net):
     assert texts(net.take("bot")) == ["still fine"]
 
 
+
+def test_a_message_too_long_leaves_the_olm_chain_where_it_was(net):
+    # Review I, I4b: encrypted before its length was checked, each too-long
+    # message moved the chain, so past 40 of them the receiver could no
+    # longer decrypt a message sent before them that arrived after.
+    from irc_olm.engine import SendFailed
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ciao"}))
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "ciao"}))
+    net.take("bot")
+    early = vjt.send("bot", {"t": "text", "body": "early"})
+    for _ in range(45):
+        res = vjt.send("bot", {"t": "text", "body": "x" * 40_000})
+        assert [e.reason for e in res.events if isinstance(e, SendFailed)] == ["too-long"]
+    late = vjt.send("bot", {"t": "text", "body": "late"})
+    events = []
+    for r in (late, early):
+        for _, body in r.outbound:
+            events += bot.receive("vjt", body).events
+    assert [e for e in events if isinstance(e, Undecryptable)] == []
+    assert texts(events) == ["late", "early"]
+
 def test_a_first_pkmsg_that_opens_no_session_gets_a_nack(net):
     import vodozemac as vz
     from irc_olm.engine import b64u
