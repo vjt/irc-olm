@@ -84,6 +84,13 @@ def canonical_curve25519(key: str) -> str:
     return vz.Curve25519PublicKey.from_base64(key).to_base64()
 
 
+def encode_inner(inner: dict) -> bytes:
+    """An inner message as the bytes Olm encrypts. Raises TypeError or
+    ValueError (a lone surrogate, NaN, a value JSON has no form for)."""
+    return json.dumps(inner, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).encode()
+
+
 # --- public types ----------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -186,7 +193,7 @@ class Result:
 class _Queued:
     nick: str
     ed25519: str     # the key it was meant for: it never goes to another one
-    inner: dict
+    plaintext: bytes = field(repr=False)
     at: float
 
 
@@ -195,7 +202,7 @@ class _Sent:
     nick: str
     ed25519: str
     session_id: str
-    inner: dict
+    plaintext: bytes = field(repr=False)
     at: float
 
 
@@ -308,24 +315,31 @@ class Engine:
             if peer is None:
                 res.events.append(SendFailed(nick, "unpinned-nick", 1))
                 return res
-            self._send_to(nick, peer, inner, res)
+            try:
+                # Encoded once, here: past this point nothing can fail on it,
+                # in a queue flush or a re-send least of all.
+                plaintext = encode_inner(inner)
+            except (TypeError, ValueError):
+                res.events.append(SendFailed(nick, "unencodable", 1))
+                return res
+            self._send_to(nick, peer, plaintext, res)
             return res
 
-    def _send_to(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
+    def _send_to(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
         # While keys are asked for (first contact, or a re-key after a NACK)
         # the sessions we still hold are the ones that failed: wait.
         if self._sessions.get(peer.curve25519) and fold(nick) not in self._keyreq_at:
-            self._encrypt(nick, peer, inner, res)
+            self._encrypt(nick, peer, plaintext, res)
         else:
-            self._enqueue(nick, peer, inner, res)
+            self._enqueue(nick, peer, plaintext, res)
 
-    def _enqueue(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
+    def _enqueue(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
         key = fold(nick)
         q = self._live_queue(key, res)
         if len(q) >= OUTQ_MAX:
             res.events.append(SendFailed(nick, "queue-full", 1))
             return
-        q.append(_Queued(nick, peer.ed25519, inner, self._now()))
+        q.append(_Queued(nick, peer.ed25519, plaintext, self._now()))
         self._outq[key] = q
         res.events.append(SendQueued(nick, len(q)))
         self._maybe_keyreq(nick, peer, res)
@@ -349,9 +363,9 @@ class Engine:
         self._keyreq_for[key] = peer.ed25519
         self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res)
 
-    def _encrypt(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
+    def _encrypt(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
         session = self._sessions[peer.curve25519][0]
-        msg = session.encrypt(json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode())
+        msg = session.encrypt(plaintext)
         mtype, ct = msg.to_parts()
         if mtype == 0:
             verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self.identity, "body": b64u(ct)}
@@ -360,7 +374,7 @@ class Engine:
                                     "body": b64u(ct)}
         self._save()
         msgid = self._emit(nick, verb, payload, res)
-        self._sent[msgid] = _Sent(fold(nick), peer.ed25519, session.session_id, inner, self._now())
+        self._sent[msgid] = _Sent(fold(nick), peer.ed25519, session.session_id, plaintext, self._now())
         self._trim_sent()
 
     def _emit(self, nick: str, verb: str, payload: dict, res: Result) -> str:
@@ -457,7 +471,7 @@ class Engine:
         lost = 0
         for q in self._live_queue(key, res):
             if q.ed25519 == peer.ed25519:
-                self._encrypt(nick, peer, q.inner, res)
+                self._encrypt(nick, peer, q.plaintext, res)
             else:
                 lost += 1   # queued for a key the operator has since replaced
         self._outq.pop(key, None)
@@ -567,7 +581,7 @@ class Engine:
             # one the peer has used since): re-send there, no new session.
             self._sessions[peer.curve25519] = rest
             self._save()
-            return self._send_to(nick, peer, sent.inner, res)
+            return self._send_to(nick, peer, sent.plaintext, res)
         # The failed session is our newest: only a new one helps, and the
         # spec allows one per peer per minute.
         last = self._rekey_at.get(peer.ed25519)
@@ -579,7 +593,7 @@ class Engine:
         res.events.append(Rekeying(nick, peer))
         # Re-send the lost message on the new session (the spec's MAY).
         self._keyreq_at.pop(fold(nick), None)
-        self._enqueue(nick, peer, sent.inner, res)
+        self._enqueue(nick, peer, sent.plaintext, res)
 
     def _undecryptable(self, nick: str, msgid: str, reason: str, res: Result) -> None:
         res.events.append(Undecryptable(nick, msgid, reason))
