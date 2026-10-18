@@ -50,7 +50,9 @@ OUTQ_MAX = 16
 REKEY_INTERVAL = 60.0        # spec: at most one new session per peer per minute
 OTK_PER_NICK_INTERVAL = 60.0 # one one-time key per nick per minute, else the fallback
 OTK_GLOBAL_PER_HOUR = 30
-SENT_MEMORY = 120.0          # plaintexts kept for a re-send after a NACK
+SENT_MEMORY = 600.0          # plaintexts kept for a re-send after a NACK. Under
+                             # bahamut's flood bank a 64-line message leaves one
+                             # line every ~5 s: its NACK comes minutes after send()
 MAX_SENDS = 2                # a message goes out at most twice: once, and once
                              # more on a fresh session after a NACK
 MAX_SESSIONS_PER_PEER = 5

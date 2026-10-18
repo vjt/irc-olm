@@ -31,7 +31,7 @@ class Rejected:
 class _Pending:
     verb: str
     total: int
-    started: float
+    last: float          # the latest fragment: paced, a long message takes minutes
     chunks: dict[int, str] = field(default_factory=dict)
 
     @property
@@ -71,6 +71,7 @@ class Reassembler:
             return self._reject(sender, frag.msgid, "duplicate-fragment")
 
         p.chunks[frag.index] = frag.chunk
+        p.last = self.clock()
         if sum(q.size for q in mine.values()) > self.max_bytes:
             return self._reject(sender, frag.msgid, "sender-byte-cap")
         if len(p.chunks) < p.total:
@@ -92,5 +93,5 @@ class Reassembler:
         cutoff = self.clock() - self.timeout
         for sender in list(self._pending):
             for msgid, p in list(self._pending[sender].items()):
-                if p.started < cutoff:
+                if p.last < cutoff:
                     self._drop(sender, msgid)

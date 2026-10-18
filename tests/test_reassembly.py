@@ -111,3 +111,25 @@ def test_bytes_are_released_when_a_message_completes():
         payload, fs = frags(600)
         results = [r.feed("vjt", f) for f in fs]
         assert results[-1] == Assembled("MSG", fs[0].msgid, payload)
+
+
+def test_a_slow_message_survives_while_its_fragments_keep_coming():
+    # Paced under the server's flood bank, a long message takes minutes.
+    r, clock = make()
+    payload, fs = frags(3000)
+    assert len(fs) > 4
+    for f in fs[:-1]:
+        assert r.feed("vjt", f) is None
+        clock.t += 50
+    assert r.feed("vjt", fs[-1]).payload == payload
+
+
+def test_an_incomplete_message_is_discarded_60s_after_its_last_fragment():
+    r, clock = make()
+    _, fs = frags(1000)
+    r.feed("vjt", fs[0])
+    clock.t += 50
+    r.feed("vjt", fs[1])
+    clock.t += 60.5
+    for f in fs[2:]:
+        assert r.feed("vjt", f) is None

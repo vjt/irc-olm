@@ -60,15 +60,24 @@ that group or others can read is refused, the way ssh refuses a private key.
 ## Wiring it into a bot
 
 ```python
+import time
+
 from irc_olm import framing, store
 from irc_olm.pins import load_pins
 from irc_olm.engine import Engine, Received, KeyAlarm, AckOk, ChallengeExpired
-from irc_olm.pacing import PacedSender
+from irc_olm.pacing import FakeLag, Pacer, PacedSender
 
 engine = Engine("azzurra.state.json", store.load_key("azzurra.key"),
                 network="azzurra", nick="vjt-claude", ident="claude",
                 pins=load_pins("/etc/vjt-claude/e2e.pins"))
-pacer = PacedSender(lambda target, body: send_raw(f"PRIVMSG {target} :{body}"))
+lag = FakeLag()      # the server's flood bank for this connection
+# The pacer charges the lines it releases: write them, do not charge them again.
+pacer = PacedSender(lambda target, body: write_line(f"PRIVMSG {target} :{body}"),
+                    Pacer(fakelag=lag))
+
+def send_raw(line):  # every OTHER line: registration, PONG, chat
+    lag.charge(line, time.monotonic())
+    write_line(line)
 
 def dispatch(result):
     # Lines leave in the order the engine produced them: call the engine and
@@ -162,13 +171,31 @@ of `repr()`, but log lengths, never bodies.
 
 ## Pacing
 
-bahamut (Azzurra) drops every CTCP to a client for 15 s once it has received
-more than 4 in its 3 s window. That window is in integer seconds, and a steady
-sender's count keeps accumulating while it lasts, so 3 lines per 3 s still trips
-it. The default is **3 lines per 6 s per target**. `tests/flud_model.py` ports
-bahamut's check, and the tests drive the default through it.
+Two limits, both from bahamut (Azzurra):
 
-Each target queues at most 512 lines (about 17 minutes at that rate). A batch
+- **Per target, for the receiver.** bahamut drops every CTCP to a client for
+  15 s once it has received more than 4 in its 3 s window. That window is in
+  integer seconds, and a steady sender's count keeps accumulating while it
+  lasts, so 3 lines per 3 s still trips it. The default is **3 lines per 6 s
+  per target**. `tests/flud_model.py` ports bahamut's check.
+- **Per connection, for the sender.** Every line costs its sender
+  `2 + bytes/120` seconds of fake lag; the server parses a client's lines only
+  while that bank is under 10 s, and more than 2560 unparsed bytes disconnect
+  it ("Excess Flood"). A full E2E line costs 5 s, so the per-target window
+  alone gets a long sender killed at about the 14th line. `FakeLag` models
+  the bank (the same arithmetic as grappa's), and a line is released only
+  when the bank plus its cost stays at or under 10 s, so no line ever waits
+  unparsed on the server. The bank must see every line on the connection:
+  the pacer charges its own, the application charges the rest.
+  `tests/fakelag_model.py` ports the server side.
+
+A long message is therefore slow: 64 full lines take over five minutes, and
+receivers keep a partial message for 60 s after its LAST fragment (vjt's
+ruling on grappa-irc#2430). Single-line messages (KEYREQ, NACK, a challenge,
+an ACK) go out ahead of the remaining fragments of longer ones, so a
+challenge does not expire in the queue.
+
+Each target queues at most 512 lines. A batch
 that does not fit is refused whole and logged, since half a fragmented message
 is worse than none. A `send` that raises is logged and the thread carries on.
 
