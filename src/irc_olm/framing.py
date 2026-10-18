@@ -36,6 +36,15 @@ _LINE = re.compile(
 )
 
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def fold(nick: str) -> str:
+    """CASEMAPPING=ascii fold: A-Z only, like grappa's canonical_target. Every
+    nick used as a key (pins, queues, rate limits, reassembly) goes through it."""
+    return nick.translate(_ASCII_LOWER)
+
+
 class PayloadError(ValueError):
     """A payload that cannot be encoded, fragmented or decoded."""
 

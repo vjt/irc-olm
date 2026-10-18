@@ -1,4 +1,4 @@
-"""Command line: `python -m irc_olm keygen PATH`."""
+"""Command line: `python -m irc_olm keygen PATH` and `identity --state PATH`."""
 
 from __future__ import annotations
 
@@ -19,12 +19,26 @@ def _keygen(args) -> int:
     return 0
 
 
+def _identity(args) -> int:
+    doc = store.StateFile(args.state).load()
+    if doc is None:
+        print(f"{args.state}: no such state file (the bot creates it on first start)",
+              file=sys.stderr)
+        return 1
+    # The key to paste into the peer's configuration (cicchetto's manual pin).
+    print(doc["identity"]["ed25519"])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m irc_olm")
     sub = p.add_subparsers(dest="cmd", required=True)
     k = sub.add_parser("keygen", help="write a new pickle key (mode 600)")
     k.add_argument("path")
     k.set_defaults(func=_keygen)
+    i = sub.add_parser("identity", help="print this identity's Ed25519 key, to paste into peers")
+    i.add_argument("--state", required=True)
+    i.set_defaults(func=_identity)
     args = p.parse_args(argv)
     return args.func(args)
 

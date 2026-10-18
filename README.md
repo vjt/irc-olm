@@ -36,6 +36,25 @@ file. Keep it out of any repository, next to the bot's other secrets.
 **Losing it means a new identity**, and every peer then sees a key alarm and has
 to verify again.
 
+## Pinned keys
+
+A bot talks E2E only to the keys its operator pinned (vjt's ruling on
+grappa-irc#2430). There is no trust-on-first-use and no SAS on a bot. The pins
+file has one `<nick> <ed25519>` per line, and the key is the peer's Ed25519 key
+exactly as it shows it (unpadded base64, 43 chars). An unknown key gets
+silence: no KEYS, no NACK, no session. Rotation means re-pasting the key and
+reloading (`Engine.set_pins`).
+
+The bot only reads the pins file. **It must not be writable by the bot's own
+Claude session**: the operator makes it root-owned in a root-owned directory,
+or denies it in that session's permission rules. `pins_writable()` lets the
+bot warn when it is not.
+
+To print the bot's own key for pasting into the other side (cicchetto's
+manual pin):
+
+    python -m irc_olm identity --state azzurra.state.json
+
 There is one identity, and so one state file and one key, per network. The state
 file is replaced atomically on every change, at mode 600. A state file or key
 that group or others can read is refused, the way ssh refuses a private key.
@@ -44,11 +63,13 @@ that group or others can read is refused, the way ssh refuses a private key.
 
 ```python
 from irc_olm import framing, store
+from irc_olm.pins import load_pins
 from irc_olm.engine import Engine, Received, KeyAlarm, AckOk, ChallengeExpired
 from irc_olm.pacing import PacedSender
 
 engine = Engine("azzurra.state.json", store.load_key("azzurra.key"),
-                network="azzurra", nick="vjt-claude", ident="claude")
+                network="azzurra", nick="vjt-claude", ident="claude",
+                pins=load_pins("/etc/vjt-claude/e2e.pins"))
 pacer = PacedSender(lambda target, body: send_raw(f"PRIVMSG {target} :{body}"))
 
 def dispatch(result):
@@ -79,14 +100,14 @@ of `repr()`, but log lengths, never bodies.
 
 ## Security notes
 
-- **Pins are on keys, never on nicks.** A key the nick is not pinned to raises
-  `KeyAlarm`. Its messages arrive attributed to that new, unverified key, and
-  nothing queued for the pinned identity is ever sent to it. Only `verify()`,
-  a human decision, moves a pin.
+- **Pins are on keys, never on nicks.** A pinned key is accepted under any
+  nick. A different key on a pinned nick raises `KeyAlarm` for the log and is
+  ignored. Nothing queued for the pinned identity is ever sent to another
+  key.
 - **Replays.** A pre-key message built on the fallback key can be replayed and
   would decrypt the old plaintext again. Seen session ids are persisted, and a
   replayed one is never decrypted.
-- **Order challenges** (`Engine.challenge`) go only to a verified key. Each one
+- **Order challenges** (`Engine.challenge`) go only to a pinned key. Each one
   is single use and expires after 15 s.
 - **Threat model.** Whoever owns the bot's host owns its key and reads its side
   of every conversation. The second factor protects against impersonating the
