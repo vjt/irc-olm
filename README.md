@@ -122,18 +122,24 @@ of `repr()`, but log lengths, never bodies.
   replayable, and its signature only says the Ed25519 key claims that
   curve25519 key. A peer's curve is stored only once a session exists, and the
   nick it is reached at moves only once a message decrypted. A curve learned
-  from keys we asked for is a claim until a message decrypts on it; a pre-key
-  message that decrypts proves the curve and takes it from a key that only
-  claimed it. One curve belongs to one pinned key; a second key claiming a
-  proven curve is refused, and nobody may claim ours. A nick hint names one
+  from keys we asked for stays a claim, even once messages decrypt on that
+  session; only a pre-key message the curve's holder built to us proves it,
+  and takes it from a key that only claimed it. One curve belongs to one
+  pinned key; a second key claiming a proven curve is refused, and nobody may
+  claim ours. A nick hint names one
   key: the last one that spoke from it. Keys are compared in vodozemac's one
   spelling.
 - **Known limit (unknown key-share).** The inner message does not name the
-  sender's and recipient's Ed25519 keys (Matrix puts both inside). The rules
-  above close it except for one window: a pinned peer that captures another
-  pinned peer's very first pre-key message off the network could get it
-  attributed to itself. Closing that needs both keys in the inner payload, a
-  wire change for both implementations.
+  sender's and recipient's Ed25519 keys (Matrix puts both inside). Two windows
+  stay open, both needing a malicious pinned key. It can capture another
+  pinned peer's very first pre-key message off the network and get it
+  attributed to itself. Or, when that peer pins it too, it can claim the
+  peer's curve, hand us the peer's one-time key and relay: the peer's messages
+  on that session then decrypt as the relayer's until the peer opens a session
+  of its own. Neither reads anything it could not read already. Check that a
+  `Received` comes from the key pinned to its nick (claude-ircbot drops it
+  otherwise). Closing both needs both keys in the inner payload, a wire change
+  for both implementations.
 - **Replays.** A pre-key message built on the fallback key can be replayed and
   would decrypt the old plaintext again. Seen session ids are persisted, and a
   replayed one is never decrypted. The fallback key also rotates weekly, and
