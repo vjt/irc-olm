@@ -390,18 +390,21 @@ def test_control_lines_and_challenges_are_urgent_text_is_not(net):
 
     bot, vjt = paired(net)
     r = vjt.send("bot", {"t": "text", "body": "hi"})
-    assert ids(r, "KEYREQ") and ids(r, "KEYREQ") <= r.urgent
+    assert ids(r, "KEYREQ") and ids(r, "KEYREQ") <= r.urgent.keys()
     keys = feed(bot, "vjt", r)
-    assert ids(keys, "KEYS") and ids(keys, "KEYS") <= keys.urgent
+    assert ids(keys, "KEYS") and ids(keys, "KEYS") <= keys.urgent.keys()
     flushed = feed(vjt, "bot", keys)
-    assert ids(flushed, "PKMSG") and not ids(flushed, "PKMSG") & flushed.urgent
+    assert ids(flushed, "PKMSG") and not ids(flushed, "PKMSG") & flushed.urgent.keys()
     feed(bot, "vjt", flushed)
     _, chal = bot.challenge("vjt", network="n", channel="#c", sender_mask="vjt!v@h", line=b"!op")
     sent = ids(chal, "PKMSG") | ids(chal, "MSG")
-    assert sent and sent <= chal.urgent
+    assert sent and sent <= chal.urgent.keys()
+    # A CHAL is useless once expired: the pacer gets the seconds it has left.
+    assert all(14 < chal.urgent[m] <= 15 for m in sent)
+    assert {r.urgent[m] for m in ids(r, "KEYREQ")} == {None}
     bot.forget_sessions(vjt.fingerprint)
     nack = feed(bot, "vjt", vjt.send("bot", {"t": "text", "body": "lost"}))
-    assert ids(nack, "NACK") and ids(nack, "NACK") <= nack.urgent
+    assert ids(nack, "NACK") and ids(nack, "NACK") <= nack.urgent.keys()
 
 
 def test_olm_decrypts_a_message_that_overtook_as_many_as_the_pacer_lets_queue(net):
@@ -419,6 +422,46 @@ def test_olm_decrypts_a_message_that_overtook_as_many_as_the_pacer_lets_queue(ne
             events += bot.receive("vjt", body).events
     assert [e for e in events if isinstance(e, Undecryptable)] == []
     assert len(texts(events)) == DEFAULT_MAX_TEXT_MESSAGES
+
+
+@pytest.mark.parametrize("refused", [1, 8])
+def test_olm_decrypts_the_queue_when_refused_messages_fill_the_rest_of_the_cap(net, refused):
+    # A message the pacer refused was encrypted, so the receiver skips its
+    # key too: the pacer counts it in the cap (Pacer.room), and Olm must
+    # still decrypt the queue an urgent message overtook.
+    from irc_olm.pacing import DEFAULT_MAX_TEXT_MESSAGES
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ciao"}))
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "ciao"}))
+    net.take("bot")
+    queued = []
+    for i in range(DEFAULT_MAX_TEXT_MESSAGES):
+        r = vjt.send("bot", {"t": "text", "body": f"m{i}"})
+        if i % (DEFAULT_MAX_TEXT_MESSAGES // refused) or len(queued) >= DEFAULT_MAX_TEXT_MESSAGES - refused:
+            queued.append(r)                                 # else refused: never sent
+    assert len(queued) == DEFAULT_MAX_TEXT_MESSAGES - refused
+    chal = vjt.send("bot", {"t": "chal", "nonce": "x"})
+    events = []
+    for r in [chal] + queued:
+        for _, body in r.outbound:
+            events += bot.receive("vjt", body).events
+    assert [e for e in events if isinstance(e, Undecryptable)] == []
+    assert len(texts(events)) == DEFAULT_MAX_TEXT_MESSAGES - refused
+
+
+def test_a_challenge_that_expired_waiting_for_keys_is_not_sent(net):
+    # Encrypting it would only open a gap in the receiver's Olm chain; the
+    # application hears of it as ChallengeExpired.
+    from irc_olm.challenge import CHALLENGE_TTL
+    from irc_olm.engine import Result
+    bot, vjt = paired(net)
+    _, res = bot.challenge("vjt", network="n", channel="#c", sender_mask="vjt!v@h", line=b"!op")
+    assert [framing.parse(b).verb for _, b in res.outbound] == ["KEYREQ"]
+    net.clock.t += CHALLENGE_TTL + 1
+    flushed = Result()
+    for _, body in vjt.receive("bot", res.outbound[0][1]).outbound:
+        flushed.extend(bot.receive("vjt", body))
+    assert flushed.outbound == [] and flushed.urgent == {}
 
 
 def test_a_retry_keyreq_that_crossed_faster_than_the_first_is_answered(net):

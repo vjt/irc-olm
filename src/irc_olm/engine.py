@@ -198,10 +198,12 @@ class ChallengeExpired:
 class Result:
     events: list = field(default_factory=list)
     outbound: list[tuple[str, str]] = field(default_factory=list)
-    # msgids of the outbound messages that go ahead of text (pacing): the
-    # KEYREQ/KEYS/NACK of the protocol, and the messages carrying a CHAL or
-    # an ACK, which expire in 15 s.
-    urgent: set[str] = field(default_factory=set)
+    # msgid -> seconds it stays useful (None: no deadline), for the outbound
+    # messages that must not wait behind text: the KEYREQ/KEYS/NACK of the
+    # protocol (the pacer budgets KEYS and NACK, which a peer draws), and the
+    # messages carrying a CHAL or an ACK. A CHAL carries what is left of its
+    # 15 s; the pacer drops it unsent past that.
+    urgent: dict[str, float | None] = field(default_factory=dict)
 
     def extend(self, other: "Result") -> "Result":
         self.events.extend(other.events)
@@ -217,6 +219,7 @@ class _Outgoing:
     plaintext: bytes = field(repr=False)
     urgent: bool     # a CHAL or an ACK: ahead of text in the pacer
     sends: int       # 1 for a first send, 2 for a re-send after a NACK
+    expires: float | None   # a CHAL's expires_at: useless, and not sent, after it
 
 
 @dataclass
@@ -339,6 +342,9 @@ class Engine:
     def send(self, nick: str, inner: dict) -> Result:
         """Encrypt `inner` for the identity pinned to `nick`, or queue it and
         ask for keys when there is no session yet."""
+        return self._send_inner(nick, inner, expires=None)
+
+    def _send_inner(self, nick: str, inner: dict, *, expires: float | None) -> Result:
         with self._lock:
             res = Result()
             peer = self.pinned(nick)
@@ -353,7 +359,7 @@ class Engine:
                 res.events.append(SendFailed(nick, "unencodable", 1))
                 return res
             urgent = isinstance(inner, dict) and inner.get("t") in URGENT_INNER
-            self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1), res)
+            self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1, expires), res)
             return res
 
     def _send_to(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
@@ -394,6 +400,9 @@ class Engine:
         self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res, urgent=True)
 
     def _encrypt(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
+        ttl = None if msg.expires is None else msg.expires - self._now()
+        if ttl is not None and ttl <= 0:
+            return          # a CHAL that expired waiting for keys: ChallengeExpired says so
         session = self._sessions[peer.curve25519][0]
         mtype, ct = session.encrypt(msg.plaintext).to_parts()
         if mtype == 0:
@@ -403,7 +412,7 @@ class Engine:
                                     "body": b64u(ct)}
         self._save()
         try:
-            msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent)
+            msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent, ttl=ttl)
         except PayloadError:
             # More than 64 fragments. The session has moved on by one
             # message, which the peer's Olm skips over.
@@ -412,14 +421,15 @@ class Engine:
         self._sent[msgid] = _Sent(nick, peer.ed25519, session.session_id, msg, self._now())
         self._trim_sent()
 
-    def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, urgent: bool) -> str:
+    def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, urgent: bool,
+              ttl: float | None = None) -> str:
         mask = self.own_mask or framing.conservative_mask(self.nick, self.ident)
         msgid = framing.new_msgid()
         for body in framing.fragment(verb, framing.encode_payload(payload), own_mask=mask,
                                      target=nick, linelen=self.linelen, msgid=msgid):
             res.outbound.append((nick, body))
         if urgent:
-            res.urgent.add(msgid)
+            res.urgent[msgid] = ttl
         return msgid
 
     def discard(self, msgids: list[str]) -> None:
@@ -685,7 +695,7 @@ class Engine:
             ch = new_challenge(nick=nick, ed25519=peer.ed25519, network=network, channel=channel,
                                sender_mask=sender_mask, line=line, now=self._now())
             self._challenges.add(ch)
-            return ch, self.send(nick, ch.inner())
+            return ch, self._send_inner(nick, ch.inner(), expires=ch.expires_at)
 
     def _on_ack(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
         ch, reason = self._challenges.check(str(inner.get("nonce")), peer.ed25519, self._now())
