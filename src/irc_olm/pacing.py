@@ -10,6 +10,7 @@ its first message is inside it, so "3 per 3 s" still trips it. 3 lines per
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -17,6 +18,11 @@ from typing import Callable
 
 DEFAULT_MAX_LINES = 3
 DEFAULT_WINDOW = 6.0
+# Lines waiting per target. At 3 lines per 6 s that is about 17 minutes of
+# backlog: past it, whatever is generating the lines is broken or hostile.
+DEFAULT_MAX_QUEUE = 512
+
+log = logging.getLogger(__name__)
 
 
 class Pacer:
@@ -27,14 +33,23 @@ class Pacer:
     each other.
     """
 
-    def __init__(self, max_lines: int = DEFAULT_MAX_LINES, window: float = DEFAULT_WINDOW):
+    def __init__(self, max_lines: int = DEFAULT_MAX_LINES, window: float = DEFAULT_WINDOW,
+                 max_queue: int = DEFAULT_MAX_QUEUE):
         self.max_lines = max_lines
         self.window = window
+        self.max_queue = max_queue
         self._queues: dict[str, deque[str]] = {}
         self._sent: dict[str, deque[float]] = {}
 
-    def submit(self, target: str, lines: list[str]) -> None:
+    def submit(self, target: str, lines: list[str]) -> bool:
+        """Queue `lines` for `target`, all or nothing: False (nothing queued)
+        when they would take the target past `max_queue`. Half a fragmented
+        message is worse than none."""
+        q = self._queues.get(target, ())
+        if len(q) + len(lines) > self.max_queue:
+            return False
         self._queues.setdefault(target, deque()).extend(lines)
+        return True
 
     def pending(self) -> int:
         return sum(len(q) for q in self._queues.values())
@@ -74,17 +89,23 @@ class PacedSender:
         self._thread = threading.Thread(target=self._run, name="irc-olm-pacer", daemon=True)
         self._thread.start()
 
-    def submit(self, target: str, lines: list[str]) -> None:
+    def submit(self, target: str, lines: list[str]) -> bool:
         with self._cv:
-            self._pacer.submit(target, lines)
+            ok = self._pacer.submit(target, lines)
             self._cv.notify()
+        if not ok:
+            log.warning("pacer queue for %s full: %d lines refused", target, len(lines))
+        return ok
 
-    def submit_all(self, outbound: list[tuple[str, str]]) -> None:
-        """Submit an Engine Result's (target, body) pairs, order kept per target."""
-        with self._cv:
-            for target, body in outbound:
-                self._pacer.submit(target, [body])
-            self._cv.notify()
+    def submit_all(self, outbound: list[tuple[str, str]]) -> int:
+        """Submit an Engine Result's (target, body) pairs, order kept per
+        target, each target's lines all or nothing. Returns the number of
+        lines refused (logged)."""
+        by_target: dict[str, list[str]] = {}
+        for target, body in outbound:
+            by_target.setdefault(target, []).append(body)
+        return sum(len(lines) for target, lines in by_target.items()
+                   if not self.submit(target, lines))
 
     def _run(self) -> None:
         while True:
@@ -96,4 +117,9 @@ class PacedSender:
                     self._cv.wait(None if wake is None else max(0.0, wake - now))
                     continue
             for target, line in batch:
-                self._send(target, line)
+                try:
+                    self._send(target, line)
+                except Exception:
+                    # One failed write (a socket mid-reconnect, say) must not
+                    # kill the thread: everything after it would wait forever.
+                    log.exception("pacer: send to %s failed, line dropped", target)
