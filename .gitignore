@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+/dist/
+/.venv/
+/.pytest_cache/
+# Runtime state and keys never belong in a repo.
+*.key
+*.state.json
