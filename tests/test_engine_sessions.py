@@ -323,3 +323,37 @@ def test_an_inner_message_that_cannot_be_encoded_is_a_send_failure(net, bad):
     assert texts(net.take("bot")) == ["ok"]                       # nothing stuck in the queue
     res = vjt.send("bot", {"t": "text", "body": bad})          # on an open session
     assert refused(res) == [("unencodable", 1)] and res.outbound == []
+
+
+def test_a_message_too_long_for_64_fragments_is_a_send_failure(net):
+    from irc_olm.engine import SendFailed
+    bot, vjt = paired(net)
+    huge = {"t": "text", "body": "x" * 40_000}
+
+    def refused(events):
+        return [(e.reason, e.lost) for e in events if isinstance(e, SendFailed)]
+
+    first = vjt.send("bot", {"t": "text", "body": "before"})  # queued, KEYREQ out
+    vjt.send("bot", huge)
+    vjt.send("bot", {"t": "text", "body": "after"})
+    net.pump("vjt", first)                                     # KEYS: the queue flushes
+    assert refused(net.take("vjt")) == [("too-long", 1)]
+    assert texts(net.take("bot")) == ["before", "after"]
+    res = vjt.send("bot", huge)                                # on an open session
+    assert refused(res.events) == [("too-long", 1)] and res.outbound == []
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "still fine"}))
+    assert texts(net.take("bot")) == ["still fine"]
+
+
+def test_a_first_pkmsg_that_opens_no_session_gets_a_nack(net):
+    import vodozemac as vz
+    from irc_olm.engine import b64u
+    bot, vjt = paired(net)
+    # vjt's first message, on a one-time key the bot never published
+    junk = vz.Account().curve25519_key
+    session = vjt._account.create_outbound_session(bot._account.curve25519_key, junk)
+    _, ct = session.encrypt(b'{"t":"text","body":"x"}').to_parts()
+    res = net.inject("vjt", "bot", "PKMSG", {"v": 1, "id": vjt.identity, "body": b64u(ct)})
+    assert [e.reason.split(":")[0] for e in res.events if isinstance(e, Undecryptable)] == \
+        ["session-creation"]
+    assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]
