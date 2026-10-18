@@ -1,5 +1,5 @@
 from irc_olm import framing
-from irc_olm.engine import (Received, RekeyThrottled, Rekeying, Undecryptable)
+from irc_olm.engine import (Received, Rekeying, SendFailed, Undecryptable)
 
 
 def texts(events):
@@ -43,7 +43,7 @@ def test_rekey_is_throttled_to_once_a_minute_per_peer(net):
     net.clock.t += 11  # past the NACK interval, inside the re-key minute
     bot.forget_sessions(vjt.fingerprint)
     chat(net, "vjt", "bot", "two")
-    assert any(isinstance(e, RekeyThrottled) for e in net.take("vjt"))
+    assert [e.reason for e in net.take("vjt", SendFailed)] == ["rekey-throttled"]
     assert texts(net.take("bot")) == []
 
 
@@ -66,5 +66,53 @@ def test_a_nack_for_someone_elses_message_is_ignored(net):
     ref = framing.parse(out[0][1]).msgid
     res = bot.receive("eve", framing.fragment("NACK", framing.encode_payload({"v": 1, "ref": ref}),
                                               own_mask="eve!e@h", target="bot")[0])
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
+    assert res.outbound == []
+
+
+def test_a_late_nack_for_an_older_session_resends_on_the_fresh_one(net):
+    bot, vjt = establish(net)
+    net.clock.t += 61
+    bot.forget_sessions(vjt.fingerprint)
+    ra = vjt.send("bot", {"t": "text", "body": "a"})
+    rb = vjt.send("bot", {"t": "text", "body": "b"})   # same old session
+    net.pump("vjt", ra)
+    assert texts(net.take("bot")) == ["a"]              # NACK, re-key, re-send
+    net.clock.t += 11                                   # past the NACK interval
+    net.pump("vjt", rb)
+    assert net.take("vjt", SendFailed) == []
+    assert texts(net.take("bot")) == ["b"]
+
+
+def test_messages_sent_while_a_rekey_is_pending_wait_for_the_new_session(net):
+    from irc_olm.engine import SendQueued
+    bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
+    # Both sides open a session at once: each ends up with two.
+    rb = bot.send("vjt", {"t": "text", "body": "x"})
+    rv = vjt.send("bot", {"t": "text", "body": "y"})
+    net.pump("bot", rb)
+    net.pump("vjt", rv)
+    assert len(vjt._sessions[bot.identity["curve25519"]]) == 2
+    net.take("bot"), net.take("vjt")
+    net.clock.t += 61
+    bot.forget_sessions(vjt.fingerprint)                 # every session, not just one
+    net.drop = lambda src, dst, body: framing.parse(body).verb == "KEYS"
+    chat(net, "vjt", "bot", "z")                         # NACK -> re-key, KEYS lost
+    rw = vjt.send("bot", {"t": "text", "body": "w"})
+    assert any(isinstance(e, SendQueued) for e in rw.events) and rw.outbound == []
+    net.drop = None
+    net.clock.t += 31
+    chat(net, "vjt", "bot", "v")
+    assert texts(net.take("bot")) == ["z", "w", "v"]
+
+
+def test_a_nack_older_than_the_resend_memory_is_ignored(net):
+    from irc_olm.engine import SENT_MEMORY, Dropped
+    bot, vjt = establish(net)
+    out = bot.send("vjt", {"t": "text", "body": "old news"}).outbound
+    ref = framing.parse(out[0][1]).msgid
+    net.clock.t += SENT_MEMORY + 1
+    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
     assert res.outbound == []

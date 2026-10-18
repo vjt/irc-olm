@@ -1,5 +1,3 @@
-import pytest
-
 from irc_olm import framing
 from irc_olm.framing import Fragment
 from irc_olm.reassembly import Assembled, Reassembler, Rejected

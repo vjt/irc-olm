@@ -194,3 +194,116 @@ def test_malformed_payloads_are_dropped_not_raised(net, payload):
         res = vjt.receive("bot", body)
         assert all(isinstance(e, Dropped) or e.__class__.__name__ in ("SendFailed", "Undecryptable")
                    for e in res.events), (verb, res.events)
+
+
+DEEP = "[" * 3000 + "]" * 3000
+
+
+def test_a_deeply_nested_payload_is_dropped_not_raised(net):
+    bot, vjt = paired(net)
+    # A NACK whose ref is the nesting: undecodable where the scanner
+    # recurses (< 3.12), an unhashable ref where it does not. Dropped both ways.
+    body = base64.b64encode(('{"v":1,"ref":' + DEEP + "}").encode()).decode()
+    for frag in framing.fragment("NACK", body, own_mask="vjt!x@h", target="bot"):
+        res = bot.receive("vjt", frag)
+    assert all(isinstance(e, Dropped) for e in res.events)
+    assert res.outbound == []
+
+
+def test_a_deeply_nested_inner_message_is_dropped_not_raised(net):
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "a"}))
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "b"}))
+    net.take("bot")
+    session = vjt._sessions[bot.identity["curve25519"]][0]
+    _, ct = session.encrypt(('{"t":"text","body":"x","deep":' + DEEP + "}").encode()).to_parts()
+    res = net.inject("vjt", "bot", "MSG", {"v": 1, "ck": vjt.identity["curve25519"],
+                                           "body": base64.b64encode(ct).decode().rstrip("=")})
+    # Delivered where the scanner does not recurse (>= 3.12), dropped where it does.
+    if texts(res.events) != ["x"]:
+        assert texts(res.events) == []
+        assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["undecodable-inner"]
+
+
+def test_a_body_that_is_not_base64_is_dropped_not_raised(net):
+    bot, vjt = paired(net)
+    res = net.inject("bot", "vjt", "PKMSG", {"v": 1, "id": bot.identity, "body": "!!!"})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-payload:Error"]
+
+
+def test_a_replayed_fallback_prekey_message_is_refused_after_a_restart(net):
+    bot, vjt = paired(net)
+    dropped = []
+
+    def drop_first_keys(src, dst, body):
+        if framing.parse(body).verb == "KEYS" and not dropped:
+            dropped.append(body)
+            return True
+        return False
+
+    net.drop = drop_first_keys
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "order 66"}))
+    net.drop = None
+    net.clock.t += 31
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ping"}))
+    assert texts(net.take("bot")) == ["order 66", "ping"]
+    pk = net.captured("PKMSG", "vjt")[0]
+    bot.forget_sessions(vjt.fingerprint)
+    bot = net.restart("bot")
+    res = net.inject("vjt", "bot", "PKMSG", pk)
+    assert texts(res.events) == []
+    assert any(isinstance(e, Replayed) for e in res.events)
+
+
+def test_keyreq_answers_are_rate_limited_per_nick(net):
+    bot, vjt = paired(net)
+    first = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+    net.clock.t += 5
+    second = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+    assert {framing.parse(b).verb for _, b in first.outbound} == {"KEYS"}
+    assert second.outbound == []
+    assert [e.reason for e in second.events if isinstance(e, Dropped)] == ["keyreq-rate-limited"]
+    net.clock.t += 6
+    assert net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound
+
+
+def test_a_keys_answer_with_a_forged_one_time_key_signature_is_dropped(net):
+    import vodozemac as vz
+    bot, vjt = paired(net)
+    vjt.send("bot", {"t": "text", "body": "queued"})
+    keys = framing.decode_payload("".join(
+        framing.parse(b).chunk for _, b in net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound))
+    keys["otk"]["key"] = vz.Account().curve25519_key.to_base64()   # sig no longer covers it
+    res = net.inject("bot", "vjt", "KEYS", keys)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-otk-signature"]
+    assert res.outbound == [] and vjt.peers()[0].curve25519 is None
+
+
+def test_queued_messages_that_expire_are_reported_lost(net):
+    from irc_olm.engine import OUTQ_TTL, SendFailed
+    bot, vjt = paired(net)
+    net.drop = lambda *_: True
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "nobody home"}))
+    net.clock.t += OUTQ_TTL + 1
+    (lost,) = [e for e in bot.tick().events if isinstance(e, SendFailed)]
+    assert (lost.nick, lost.reason, lost.lost) == ("vjt", "keys-timeout", 1)
+    assert [e for e in bot.tick().events if isinstance(e, SendFailed)] == []
+
+
+def test_the_fallback_key_rotates_weekly(net):
+    from irc_olm.engine import FALLBACK_ROTATE
+
+    def fallback_after_two_keyreqs():
+        net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+        net.clock.t += 11
+        (k,) = [framing.decode_payload("".join(framing.parse(b).chunk for _, b in
+                net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound))["otk"]]
+        assert k["fallback"] is True
+        return k["key"]
+
+    bot, vjt = paired(net)
+    first = fallback_after_two_keyreqs()
+    net.clock.t += FALLBACK_ROTATE + 1
+    bot.tick()
+    net.clock.t += 61
+    assert fallback_after_two_keyreqs() != first

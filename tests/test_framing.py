@@ -1,5 +1,4 @@
 import base64
-import json
 import re
 
 import pytest
@@ -143,3 +142,15 @@ def test_conservative_mask_is_the_worst_case_bahamut_allows():
     assert user == "~claude"
     assert len(host) == 63
     assert framing.conservative_mask("n", "a-very-long-ident").split("!")[1].split("@")[0] == "~a-very-lon"
+
+
+def test_deeply_nested_json_is_a_payload_error_never_a_crash():
+    # CPython < 3.12 raises RecursionError from the C scanner well before
+    # this depth; the line must stay a PayloadError (or decode) everywhere.
+    deep = '{"v":' + "[" * 3000 + "]" * 3000 + "}"
+    try:
+        framing.decode_payload(base64.b64encode(deep.encode()).decode())
+    except framing.PayloadError:
+        pass
+    with pytest.raises(framing.PayloadError):
+        framing.decode_payload(base64.b64encode(("[" * 3000 + "]" * 3000).encode()).decode())

@@ -1,5 +1,3 @@
-import itertools
-
 import pytest
 
 from irc_olm import framing, store
@@ -81,6 +79,20 @@ class Net:
                 if sender is None or src == sender:
                     out.append((src, f.verb, framing.decode_payload("".join(buf))))
         return out
+
+    def inject(self, src, dst, verb, payload):
+        """Hand-built traffic: `payload` framed as `verb` from `src`, fed to
+        `dst` only (nothing is pumped back). Returns the merged Result."""
+        from irc_olm.engine import Result
+        res = Result()
+        for body in framing.fragment(verb, framing.encode_payload(payload),
+                                     own_mask=f"{src}!x@h", target=dst):
+            res.extend(self.engines[dst].receive(src, body))
+        return res
+
+    def captured(self, verb, sender=None):
+        """Payloads of the logical `verb` messages on the wire, oldest first."""
+        return [p for src, v, p in self.messages(sender) if v == verb]
 
     def take(self, nick, kind=None):
         evs, self.events[nick] = self.events[nick], []

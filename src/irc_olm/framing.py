@@ -93,6 +93,9 @@ def decode_payload(data: str) -> dict:
         obj = json.loads(base64.b64decode(data, validate=True).decode())
     except (binascii.Error, UnicodeDecodeError, ValueError) as e:
         raise PayloadError(f"undecodable payload: {e}") from e
+    except RecursionError as e:
+        # Deep nesting: the C scanner recurses on CPython < 3.12.
+        raise PayloadError("payload nested too deeply") from e
     if not isinstance(obj, dict):
         raise PayloadError("payload is not a JSON object")
     return obj
