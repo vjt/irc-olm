@@ -390,7 +390,7 @@ def test_a_panic_from_vodozemac_on_wire_input_is_a_drop(net, monkeypatch):
     assert "bad-payload:PanicException" in [e.reason for e in res.events if isinstance(e, Dropped)]
 
 
-def test_a_curve_is_proven_by_a_decrypt_and_stays_proven_across_a_restart(net):
+def test_only_a_pre_key_message_proves_a_curve_and_the_proof_survives_a_restart(net):
     import json
 
     def proven(engine):
@@ -399,11 +399,54 @@ def test_a_curve_is_proven_by_a_decrypt_and_stays_proven_across_a_restart(net):
 
     bot, vjt = net.add("bot"), net.add("vjt")
     net.pair("bot", "vjt")
-    net.drop = lambda src, dst, body: src == "vjt" and framing.parse(body).verb == "MSG"
     chat(net, "bot", "vjt", "hello")          # KEYREQ, KEYS: our session, a claim
+    chat(net, "vjt", "bot", "hi back")        # a MSG on it: a relay could have made that
     assert proven(bot) is False
-    net.drop = None
-    chat(net, "vjt", "bot", "hi back")        # a MSG decrypts on it: proven
+    vjt.forget_sessions(bot.fingerprint)
+    net.clock.t += 61
+    chat(net, "vjt", "bot", "a session of its own")   # its PKMSG: proven
     assert proven(bot) is True
     net.restart("bot").set_pins(net.pins["bot"])
     assert proven(bot) is True
+
+
+def test_a_pinned_key_relaying_another_ones_session_never_owns_its_curve(net):
+    # mal claims bob's curve and hands us bob's own one-time key; bob's
+    # messages then decrypt on "mal's" session. That proves bob holds the
+    # curve, not that mal does: bob's first pre-key message takes it back.
+    from irc_olm.engine import ID_SIG_PREFIX, OTK_SIG_PREFIX
+    bot, bob, mal = net.add("bot"), net.add("bob"), net.add("mal")
+    for x, y in [("bot", "bob"), ("bot", "mal"), ("bob", "mal")]:
+        net.pair(x, y)
+    bob_curve = bob.identity["curve25519"]
+    res = net.inject("mal", "bob", "KEYREQ", {"v": 1})
+    otk = framing.decode_payload("".join(framing.parse(b).chunk for _, b in res.outbound))["otk"]["key"]
+    bot.send("mal", {"t": "text", "body": "for mal"})
+    r = net.inject("mal", "bot", "KEYS", {
+        "v": 1, "id": {"ed25519": mal.fingerprint, "curve25519": bob_curve,
+                       "sig": mal._sign(ID_SIG_PREFIX + bob_curve)},
+        "otk": {"key": otk, "fallback": False, "sig": mal._sign(OTK_SIG_PREFIX + otk)}})
+    for _, body in r.outbound:                # mal forwards our PKMSG to bob
+        bob.receive("mal", body)
+    net.pump("bob", bob.send("bot", {"t": "text", "body": "bob on that session"}))
+    net.take("bot")
+    bob.forget_sessions(bot.fingerprint)
+    net.clock.t += 61
+    chat(net, "bob", "bot", "bob, a session of his own")
+    (got,) = [e for e in net.take("bot") if isinstance(e, Received)]
+    assert got.peer.ed25519 == bob.fingerprint
+    assert bot.pinned("bob").curve25519 == bob_curve
+    assert {p.ed25519: p.curve25519 for p in bot.peers()}[mal.fingerprint] is None
+
+
+def test_a_state_file_from_before_proofs_loads_with_nothing_proven(net):
+    import json
+    bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
+    chat(net, "vjt", "bot", "hi")
+    doc = json.loads(bot.state_path.read_text())
+    for p in doc["peers"].values():
+        del p["proven"]
+    bot.state_path.write_text(json.dumps(doc))
+    bot2 = net.restart("bot")
+    assert bot2.pinned("vjt").curve25519 == vjt.identity["curve25519"]

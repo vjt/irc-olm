@@ -479,6 +479,12 @@ class Engine:
             res.events.append(Dropped(nick, "bad-otk-signature", "KEYS"))
             return
         peer = self._identify(nick, payload["id"], res, proving=False)
+        if peer is not None:
+            # First, so that a one-time key vodozemac refuses (raised as a
+            # Dropped) leaves the queue waiting, to be reported if it expires.
+            session = self._account.create_outbound_session(
+                vz.Curve25519PublicKey.from_base64(peer.curve25519),
+                vz.Curve25519PublicKey.from_base64(otk["key"]))
         del self._keyreq_at[key]
         queue = self._live_queue(key, res)
         self._outq.pop(key, None)
@@ -489,9 +495,6 @@ class Engine:
             res.events.append(SendFailed(nick, "key-mismatch", len(queue) - len(mine)))
         if not mine:
             return
-        session = self._account.create_outbound_session(
-            vz.Curve25519PublicKey.from_base64(peer.curve25519),
-            vz.Curve25519PublicKey.from_base64(otk["key"]))
         self._bind(peer, proven=False)
         self._add_session(peer.curve25519, session)
         self._rekey_at[peer.ed25519] = self._now()
@@ -565,7 +568,6 @@ class Engine:
         lst = self._sessions[peer.curve25519]
         lst.remove(session)
         lst.insert(0, session)
-        self._bind(peer, proven=True)
         self._touch(peer, nick)
         self._save()
         self._deliver(nick, peer, plaintext, res)
@@ -691,9 +693,11 @@ class Engine:
         Ed25519 key CLAIMS that curve, not that it holds it. So the caller
         stores the curve (_bind) only once a session exists, and moves the
         nick hint (_touch) only once a message decrypted. A session we opened
-        on keys we asked for proves nothing yet: until a decrypt does, the
-        curve is a claim, and `proving` (a pre-key message about to be
-        decrypted) may take it from another key that only claimed it."""
+        on keys we asked for proves nothing, and neither does a message on
+        it (a pinned key can claim another's curve, hand us that one's
+        one-time key and relay). Only a pre-key message the curve's holder
+        built to us does: `proving` may take the curve from a key that only
+        claimed it."""
         if not self._sig_ok(ident["ed25519"], ID_SIG_PREFIX + ident["curve25519"], ident["sig"]):
             res.events.append(Dropped(nick, "bad-identity-signature"))
             return None
@@ -729,9 +733,10 @@ class Engine:
         return next((ed for ed, p in self._peers.items() if p.curve25519 == curve), None)
 
     def _bind(self, peer: Peer, *, proven: bool) -> None:
-        """Store the curve a session was opened on; `proven` once a message
-        decrypted on it. A proof evicts another key's claim on that curve,
-        sessions included (_identify let it through only if unproven)."""
+        """Store the curve a session was opened on; `proven` when a pre-key
+        message decrypted on it. A proof evicts another key's claim on that
+        curve, sessions included (_identify let it through only if
+        unproven)."""
         owner = self._curve_owner(peer.curve25519)
         if owner not in (None, peer.ed25519):
             self._peers[owner] = replace(self._peers[owner], curve25519=None)
@@ -820,7 +825,7 @@ class Engine:
         self._account = vz.Account.from_pickle(doc["account"], self._key)
         self._fallback = doc["fallback"]
         self._peers = {ed: Peer(ed, p["curve25519"], p["nick"]) for ed, p in doc["peers"].items()}
-        self._proven = {ed for ed, p in doc["peers"].items() if p["proven"]}
+        self._proven = {ed for ed, p in doc["peers"].items() if p.get("proven")}
         self._sessions = {c: [vz.Session.from_pickle(s, self._key) for s in lst]
                           for c, lst in doc["sessions"].items()}
         self._seen = OrderedDict((sid, None) for sid in doc["seen_sessions"])

@@ -357,3 +357,18 @@ def test_a_first_pkmsg_that_opens_no_session_gets_a_nack(net):
     assert [e.reason.split(":")[0] for e in res.events if isinstance(e, Undecryptable)] == \
         ["session-creation"]
     assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]
+
+
+@pytest.mark.parametrize("raw", [bytes(32), bytes(31)])
+def test_keys_with_a_signed_but_unusable_one_time_key_keep_the_queue(net, raw):
+    from irc_olm.engine import OTK_SIG_PREFIX, OUTQ_TTL, SendFailed
+    bot, vjt = paired(net)
+    bot.send("vjt", {"t": "text", "body": "waits"})
+    otk = base64.b64encode(raw).decode().rstrip("=")
+    res = net.inject("vjt", "bot", "KEYS", {
+        "v": 1, "id": vjt.identity,
+        "otk": {"key": otk, "fallback": True, "sig": vjt._sign(OTK_SIG_PREFIX + otk)}})
+    assert [e for e in res.events if isinstance(e, Dropped)]
+    net.clock.t += OUTQ_TTL + 1
+    assert [(e.reason, e.lost) for e in bot.tick().events if isinstance(e, SendFailed)] == \
+        [("keys-timeout", 1)]
