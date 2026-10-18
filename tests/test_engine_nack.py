@@ -12,6 +12,7 @@ def chat(net, a, b, text):
 
 def establish(net):
     bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
     chat(net, "vjt", "bot", "hi")
     chat(net, "bot", "vjt", "hello")
     net.take("bot"), net.take("vjt")
@@ -60,6 +61,7 @@ def test_a_nack_for_someone_elses_message_is_ignored(net):
     from irc_olm.engine import Dropped
     bot, vjt = establish(net)
     eve = net.add("eve")
+    net.pair("bot", "eve")
     out = bot.send("vjt", {"t": "text", "body": "x"}).outbound
     ref = framing.parse(out[0][1]).msgid
     res = bot.receive("eve", framing.fragment("NACK", framing.encode_payload({"v": 1, "ref": ref}),

@@ -25,20 +25,32 @@ class Net:
         self.events = {}
         self.wire = []          # every (sender, target, body) ever delivered
         self.drop = None        # predicate(sender, target, body) -> bool
+        self.pins = {}          # nick -> its configured {peer nick: ed25519}
         self._keys = {}
 
     def add(self, nick, network="testnet"):
         key_path = self.tmp_path / f"{nick}.key"
         if not key_path.exists():
             store.generate_key_file(key_path)
+        self.pins.setdefault(nick, {})
         e = Engine(self.tmp_path / f"{nick}.{network}.state.json", store.load_key(key_path),
-                   network=network, nick=nick, ident=nick[:10], clock=self.clock)
+                   network=network, nick=nick, ident=nick[:10], pins=self.pins[nick],
+                   clock=self.clock)
         self.engines[nick] = e
         self.events.setdefault(nick, [])
         return e
 
     def restart(self, nick):
         return self.add(nick)
+
+    def pin(self, a, b, key=None):
+        """`a`'s operator pastes `b`'s key into `a`'s configuration."""
+        self.pins[a][b] = key or self.engines[b].fingerprint
+        self.engines[a].set_pins(self.pins[a])
+
+    def pair(self, a, b):
+        self.pin(a, b)
+        self.pin(b, a)
 
     def pump(self, sender, result):
         """Deliver `result` from `sender`; returns nothing, events pile up

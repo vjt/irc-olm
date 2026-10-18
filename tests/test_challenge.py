@@ -3,17 +3,16 @@ import re
 
 import pytest
 
-from irc_olm.engine import (AckOk, AckRejected, ChallengeExpired, NotVerifiedError, Received)
+from irc_olm.engine import (AckOk, AckRejected, ChallengeExpired, NotPinnedError, Received)
 from irc_olm.challenge import CHALLENGE_TTL
 
 
-def establish(net, verify=True):
+def establish(net):
     bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "hi"}))
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))
     net.take("bot"), net.take("vjt")
-    if verify:
-        bot.verify(vjt.fingerprint)
     return bot, vjt
 
 
@@ -64,8 +63,8 @@ def test_ack_after_expiry_is_rejected_and_tick_reports_the_expiry(net):
 def test_ack_from_another_key_is_rejected_and_does_not_burn_the_nonce(net):
     bot, vjt = establish(net)
     eve = net.add("eve")
+    net.pair("bot", "eve")
     net.pump("eve", eve.send("bot", {"t": "text", "body": "hi"}))
-    bot.verify(eve.fingerprint)
     ch = chal(net, bot)
     net.pump("eve", eve.send("bot", {"t": "ack", "nonce": ch.nonce}))
     assert [e.reason for e in net.take("bot", AckRejected)] == ["wrong-peer"]
@@ -73,9 +72,7 @@ def test_ack_from_another_key_is_rejected_and_does_not_burn_the_nonce(net):
     assert len(net.take("bot", AckOk)) == 1
 
 
-def test_no_challenge_to_an_unverified_key(net):
-    bot, vjt = establish(net, verify=False)
-    with pytest.raises(NotVerifiedError):
-        bot.challenge("vjt", network="TestNet", channel="#x", sender_mask="m", line=b"x")
-    with pytest.raises(NotVerifiedError):
+def test_no_challenge_to_an_unpinned_nick(net):
+    bot, vjt = establish(net)
+    with pytest.raises(NotPinnedError):
         bot.challenge("nobody", network="TestNet", channel="#x", sender_mask="m", line=b"x")
