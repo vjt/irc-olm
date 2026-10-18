@@ -49,7 +49,7 @@ def drain(p, t0, step=0.05, until=600.0):
 
 
 def test_burst_then_one_line_every_window_per_target():
-    p = Pacer(max_lines=3, window=6.0)
+    p = Pacer(max_lines=3, window=6.0, fakelag=None)
     p.submit("vjt", [f"l{i}" for i in range(7)])
     sent = drain(p, 0.0)
     times = [round(t, 2) for t, _, _ in sent]
@@ -60,7 +60,7 @@ def test_burst_then_one_line_every_window_per_target():
 
 
 def test_targets_are_paced_independently():
-    p = Pacer(max_lines=3, window=6.0)
+    p = Pacer(max_lines=3, window=6.0, fakelag=None)
     p.submit("a", ["a1", "a2", "a3", "a4"])
     p.submit("b", ["b1"])
     first = p.due(0.0)
@@ -68,7 +68,7 @@ def test_targets_are_paced_independently():
 
 
 def test_next_wakeup_is_the_earliest_slot():
-    p = Pacer(max_lines=3, window=6.0)
+    p = Pacer(max_lines=3, window=6.0, fakelag=None)
     assert p.next_wakeup(0.0) is None
     p.submit("a", ["1", "2", "3", "4"])
     p.due(1.0)
@@ -78,7 +78,7 @@ def test_next_wakeup_is_the_earliest_slot():
 @pytest.mark.parametrize("seed", range(20))
 def test_default_pacing_never_trips_bahamut_flud(seed):
     rng = random.Random(seed)
-    p = Pacer()  # the defaults are what ships
+    p = Pacer(fakelag=None)  # the per-target defaults are what ships
     t = 0.0
     events = []
     for _ in range(rng.randint(1, 15)):
@@ -101,7 +101,7 @@ def test_default_pacing_never_trips_bahamut_flud(seed):
 
 def test_three_per_three_seconds_does_trip_it():
     # Pins the reason the default is not the obvious 3-per-3s window.
-    p = Pacer(max_lines=3, window=3.0)
+    p = Pacer(max_lines=3, window=3.0, fakelag=None)
     p.submit("vjt", ["x"] * 6)
     sent = [t for t, _, _ in drain(p, 0.0)]
     m = FludModel()
@@ -119,7 +119,7 @@ def test_paced_sender_thread_delivers_in_order():
         if len(got) == 5:
             done.set()
 
-    s = PacedSender(send, Pacer(max_lines=2, window=0.1))
+    s = PacedSender(send, Pacer(max_lines=2, window=0.1, fakelag=None))
     s.submit("vjt", ["1", "2", "3", "4", "5"])
     assert done.wait(5)
     assert got == [("vjt", str(i)) for i in range(1, 6)]
@@ -136,7 +136,7 @@ def test_submit_all_keeps_order_per_target():
         if len(got) == 4:
             done.set()
 
-    s = PacedSender(send, Pacer(max_lines=3, window=0.1))
+    s = PacedSender(send, Pacer(max_lines=3, window=0.1, fakelag=None))
     s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")])
     assert done.wait(5)
     assert [x for x in got if x[0] == "a"] == [("a", "a1"), ("a", "a2")]
@@ -156,15 +156,138 @@ def test_paced_sender_survives_a_send_that_raises():
         if line == "after":
             done.set()
 
-    s = PacedSender(send, Pacer(max_lines=3, window=0.1))
+    s = PacedSender(send, Pacer(max_lines=3, window=0.1, fakelag=None))
     s.submit("vjt", ["boom", "after"])
     assert done.wait(2)
     assert got == ["after"]
 
 
 def test_pacer_refuses_a_whole_batch_past_its_per_target_cap():
-    p = Pacer(max_lines=3, window=6.0, max_queue=4)
+    p = Pacer(max_lines=3, window=6.0, max_queue=4, fakelag=None)
     assert p.submit("vjt", ["1", "2", "3"]) is True
     assert p.submit("vjt", ["4", "5"]) is False
     assert p.pending() == 3
     assert p.submit("other", ["a", "b", "c", "d"]) is True
+
+
+# --- fake lag (bahamut's flood bank) -------------------------------------
+
+from fakelag_model import ServerModel  # noqa: E402
+from irc_olm import framing  # noqa: E402
+from irc_olm.pacing import FakeLag  # noqa: E402
+
+FULL = "x" * (400 - len("PRIVMSG vjt :"))      # a full E2E line, 400 bytes before CRLF
+
+
+def run_against_server(p, t0=1000.0, step=0.05, until=900.0, also=()):
+    """Drain the pacer into the server model; `also` = [(t, line)] the
+    application writes itself at those times (already charged by the caller)."""
+    server, out, extra = ServerModel(), [], sorted(also)
+    for k in range(int(until / step)):
+        t = t0 + k * step
+        while extra and extra[0][0] <= t:
+            server.arrive(extra.pop(0)[1], int(t))
+        for target, body in p.due(t):
+            out.append((t, target, body))
+            server.arrive(f"PRIVMSG {target} :{body}", int(t))
+        server.drain(int(t))
+        if not p.pending() and not extra:
+            break
+    return server, out
+
+
+def test_fakelag_cost_is_bahamuts_integer_arithmetic_on_the_whole_frame():
+    # 2 + bytes/120, bytes = the frame as written, CRLF included (as grappa's FakeLag)
+    assert FakeLag.cost("x" * 117) == 2          # 119 bytes with CRLF
+    assert FakeLag.cost("x" * 118) == 3          # 120
+    assert FakeLag.cost("PRIVMSG vjt :" + FULL) == 5
+
+
+def test_fakelag_bank_drains_in_real_time_and_never_goes_negative():
+    lag = FakeLag()
+    assert lag.bank(100.0) == 0.0
+    lag.charge("PRIVMSG vjt :" + FULL, 100.0)
+    lag.charge("PRIVMSG vjt :" + FULL, 100.0)
+    assert lag.bank(100.0) == 10.0
+    assert lag.bank(104.0) == 6.0
+    assert lag.bank(200.0) == 0.0
+    lag.charge("PRIVMSG vjt :x", 200.0)
+    assert lag.bank(200.0) == 2.0               # from the floor, no debt carried
+
+
+def test_three_lines_per_six_seconds_alone_get_a_long_sender_killed():
+    # Pins why the per-target window is not enough on its own.
+    p = Pacer(fakelag=None)
+    p.submit("vjt", [FULL] * 20)
+    server, _ = run_against_server(p)
+    assert server.killed_at is not None
+
+
+def test_with_the_bank_no_line_ever_waits_unparsed_on_the_server():
+    p = Pacer(fakelag=FakeLag())
+    p.submit("vjt", [FULL] * 64)
+    server, out = run_against_server(p)
+    assert server.killed_at is None
+    assert server.max_backlog == 0
+    assert len(out) == len(server.parsed) == 64
+    assert 300 <= out[-1][0] - out[0][0] <= 330    # one full line every ~5 s
+
+
+def test_lines_the_application_writes_count_in_the_same_bank():
+    def last_e2e_line_at(talk):
+        lag = FakeLag()
+        for t, line in talk:
+            lag.charge(line, t)       # the application charges what it writes itself
+        p = Pacer(fakelag=lag)
+        p.submit("vjt", [FULL] * 20)
+        server, out = run_against_server(p, also=talk)
+        assert server.killed_at is None and server.max_backlog == 0
+        return out[-1][0]
+
+    chatter = "PRIVMSG #sbiffo :" + "y" * 380
+    talking = [(1000.0 + 8 * i, chatter) for i in range(12)]   # the bot talking meanwhile
+    assert last_e2e_line_at(talking) > last_e2e_line_at([])    # E2E backed off for it
+
+
+def _message(n_lines_wanted, target="vjt"):
+    size = 300 * n_lines_wanted
+    payload = framing.encode_payload({"v": 1, "body": "z" * size})
+    bodies = framing.fragment("MSG", payload, own_mask="bot!b@h", target=target)
+    assert (len(bodies) > 1) == (n_lines_wanted > 1)
+    return bodies
+
+
+def test_single_line_messages_go_ahead_of_a_long_messages_fragments():
+    p = Pacer(fakelag=FakeLag())
+    long_msg = _message(12)
+    p.submit("vjt", long_msg)
+    chal = _message(1)                  # a CHAL, queued after it: 15 s to live
+    p.submit("vjt", chal)
+    other = _message(1, target="lucy")
+    p.submit("lucy", other)
+    _, out = run_against_server(p)
+    order = [body for _, _, body in out]
+    sent_at = {body: t - 1000.0 for t, _, body in out}
+    assert sent_at[chal[0]] < 15 and sent_at[other[0]] < 15
+    assert order.index(chal[0]) < order.index(long_msg[-1])
+    assert [b for b in order if b in long_msg] == long_msg     # its own order kept
+
+
+def test_the_per_target_window_still_holds_for_single_lines():
+    # Small lines (KEYREQs, 2 s each): the bank would let five through at
+    # once, the receiver's CTCP flood limit only three.
+    keyreq = lambda: framing.fragment("KEYREQ", framing.encode_payload({"v": 1}),  # noqa: E731
+                                      own_mask="bot!b@h", target="vjt")[0]
+    p = Pacer(fakelag=FakeLag())
+    p.submit("vjt", [keyreq() for _ in range(6)])
+    _, out = run_against_server(p)
+    times = [round(t - 1000.0, 2) for t, _, _ in out]
+    assert times[:3] == [0.0, 0.0, 0.0] and min(times[3:]) >= 6.0
+
+
+def test_a_bank_without_room_sets_the_next_wakeup_instead_of_spinning():
+    p = Pacer(fakelag=FakeLag())
+    p.submit("vjt", [FULL] * 3)
+    assert len(p.due(1000.0)) == 2            # 5 s + 5 s: the bank is full
+    assert p.due(1000.0) == []
+    assert p.next_wakeup(1000.0) == 1005.0    # room for the third line, not "now"

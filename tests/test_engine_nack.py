@@ -267,3 +267,17 @@ def test_a_nack_for_an_older_session_while_a_rekey_is_pending_waits_for_it(net):
     vjt_evs = net.take("vjt")
     assert [e for e in vjt_evs if isinstance(e, SendFailed)] == []
     assert sum(isinstance(e, Rekeying) for e in vjt_evs) == 1
+
+
+def test_a_nack_for_a_long_message_still_finds_it_minutes_later(net):
+    # 64 full lines leave one every ~5 s under the server's flood bank: the
+    # receiver can only NACK minutes after the message was encrypted.
+    from irc_olm.engine import Dropped
+    bot, vjt = establish(net)
+    net.clock.t += 61
+    out = bot.send("vjt", {"t": "text", "body": "long"}).outbound
+    ref = framing.parse(out[0][1]).msgid
+    net.clock.t += 64 * 5 + 30
+    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
+    assert not [e for e in res.events if isinstance(e, Dropped)]
+    assert res.outbound                               # re-keying to re-send it
