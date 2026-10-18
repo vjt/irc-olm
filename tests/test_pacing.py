@@ -123,3 +123,21 @@ def test_paced_sender_thread_delivers_in_order():
     s.submit("vjt", ["1", "2", "3", "4", "5"])
     assert done.wait(5)
     assert got == [("vjt", str(i)) for i in range(1, 6)]
+
+
+def test_submit_all_keeps_order_per_target():
+    import threading
+    from irc_olm.pacing import PacedSender
+
+    got, done = [], threading.Event()
+
+    def send(target, line):
+        got.append((target, line))
+        if len(got) == 4:
+            done.set()
+
+    s = PacedSender(send, Pacer(max_lines=3, window=0.1))
+    s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")])
+    assert done.wait(5)
+    assert [x for x in got if x[0] == "a"] == [("a", "a1"), ("a", "a2")]
+    assert [x for x in got if x[0] == "b"] == [("b", "b1"), ("b", "b2")]

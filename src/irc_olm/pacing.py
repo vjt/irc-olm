@@ -79,6 +79,13 @@ class PacedSender:
             self._pacer.submit(target, lines)
             self._cv.notify()
 
+    def submit_all(self, outbound: list[tuple[str, str]]) -> None:
+        """Submit an Engine Result's (target, body) pairs, order kept per target."""
+        with self._cv:
+            for target, body in outbound:
+                self._pacer.submit(target, [body])
+            self._cv.notify()
+
     def _run(self) -> None:
         while True:
             with self._cv:
