@@ -135,20 +135,23 @@ def test_an_incomplete_message_is_discarded_60s_after_its_last_fragment():
         assert r.feed("vjt", f) is None
 
 
-def test_buffered_bytes_are_capped_across_senders_oldest_first():
+def test_buffered_bytes_are_capped_across_senders_newest_first_on_a_tie():
     # Pending messages live 60 s from their LAST fragment: one fragment a
     # minute keeps one alive, so a nick-changing sender needs a global cap.
+    # On a tie the sender that started last goes, here the one feeding: the
+    # one that started first is, paced, the honest long message.
     r, clock = make(max_bytes_total=1500)
     msgs = []
-    for i in range(6):
+    for i in range(4):
         _, fs = frags(600)                        # 2 fragments: ~460 bytes buffered each
         assert len(fs) == 2 and 3 * len(fs[0].chunk) <= 1500 < 4 * len(fs[0].chunk)
-        assert r.feed(f"nick{i}", fs[0]) is None
+        res = r.feed(f"nick{i}", fs[0])
         msgs.append(fs)
         clock.t += 1
-    assert r.feed("nick0", msgs[0][1]) is None    # evicted: its rest starts over
-    assert isinstance(r.feed("nick5", msgs[5][1]), Assembled)
-    assert isinstance(r.feed("nick4", msgs[4][1]), Assembled)
+    assert res == Rejected(msgs[3][0].msgid, "global-byte-cap", "MSG")
+    assert r.take_evicted() == []
+    for i in range(3):
+        assert isinstance(r.feed(f"nick{i}", msgs[i][1]), Assembled)
 
 
 def test_the_global_cap_takes_from_the_sender_holding_the_most_first():
@@ -167,3 +170,22 @@ def test_the_global_cap_takes_from_the_sender_holding_the_most_first():
         r.feed("mal1", f)                         # past 6000: mal0's goes, not vjt's
     assert isinstance([r.feed("vjt", f) for f in vjt[2:]][-1], Assembled)
     assert r.feed("mal0", mal0[9]) is None        # it starts over
+
+
+def test_the_global_cap_takes_the_victims_message_furthest_from_completion():
+    # Not its idlest: paced, that is the one closest to done.
+    r, clock = make(max_bytes_total=3000)
+    _, near = frags(1500)
+    _, far = frags(3000)
+    for f in near[:-1]:
+        assert r.feed("mal", f) is None
+    clock.t += 5
+    for f in far[:2]:
+        assert r.feed("mal", f) is None
+    held = sum(len(f.chunk) for f in near[:-1] + far[:2])
+    assert held <= 3000 < held + len(near[0].chunk) and len(far) > 4
+    _, vjt = frags(600)
+    assert r.feed("vjt", vjt[0]) is None
+    assert r.take_evicted() == [("mal", Rejected(far[0].msgid, "global-byte-cap", "MSG"))]
+    assert r.take_evicted() == []
+    assert isinstance(r.feed("mal", near[-1]), Assembled)

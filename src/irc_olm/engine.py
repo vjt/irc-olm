@@ -44,17 +44,20 @@ ID_SIG_PREFIX = "irc-e2e:v1:id:"
 OTK_SIG_PREFIX = "irc-e2e:v1:otk:"
 
 KEYREQ_RETRY = 30.0          # re-ask for keys when still waiting after this long
-KEYS_INTERVAL = KEYREQ_RETRY # at most one KEYS answer per nick in this long: two
-                             # lines, 8 s of our flood bank
+KEYS_INTERVAL = KEYREQ_RETRY / 2  # at most one KEYS answer per nick in this long
+                             # (two lines, 8 s of our flood bank). Half the retry:
+                             # it runs from the KEYREQ's arrival here, the retry
+                             # from its sending there, after a wait in a pacer
 OUTQ_TTL = 60.0              # queued plaintext waiting for keys
 OUTQ_MAX = 16
 REKEY_INTERVAL = 60.0        # spec: at most one new session per peer per minute
 OTK_PER_NICK_INTERVAL = 60.0 # one one-time key per nick per minute, else the fallback
 OTK_GLOBAL_PER_HOUR = 30
-SENT_MEMORY = 1800.0         # plaintexts kept for a re-send after a NACK. Under
-                             # bahamut's flood bank a full pacer backlog (480 s of
-                             # bank) takes twice that with the bot talking meanwhile
-SENT_MAX = 512               # and at most this many
+SENT_MEMORY = 1800.0         # plaintexts kept for a re-send after a NACK: a full
+                             # pacer backlog (480 s of bank) leaves in 24 minutes
+                             # with a third of the bank left to text
+SENT_MAX = 1200              # and at most this many: what the bank lets out in
+                             # SENT_MEMORY (2 s a line at least) plus a backlog
 MAX_SENDS = 2                # a message goes out at most twice: once, and once
                              # more on a fresh session after a NACK
 URGENT_INNER = ("chal", "ack")  # inner types that must not wait behind text
@@ -419,6 +422,14 @@ class Engine:
             res.urgent.add(msgid)
         return msgid
 
+    def discard(self, msgids: list[str]) -> None:
+        """Forget the plaintexts of messages the pacer refused
+        (PacedSender.submit_all): they never left, so no NACK can come for
+        them, and they must not push out of SENT_MAX the ones still leaving."""
+        with self._lock:
+            for msgid in msgids:
+                self._sent.pop(msgid, None)
+
     # --- receiving ---------------------------------------------------------------
 
     def receive(self, nick: str, body: str) -> Result:
@@ -429,10 +440,12 @@ class Engine:
                 res.events.append(Dropped(nick, "malformed-or-unknown-verb"))
                 return res
             done = self._reasm.feed(fold(nick), frag)
+            for sender, gone in self._reasm.take_evicted():
+                res.events.append(Dropped(sender, f"reassembly:{gone.reason}", gone.verb))
             if done is None:
                 return res
             if isinstance(done, Rejected):
-                res.events.append(Dropped(nick, f"reassembly:{done.reason}", frag.verb))
+                res.events.append(Dropped(nick, f"reassembly:{done.reason}", done.verb))
                 return res
             try:
                 payload = framing.decode_payload(done.payload)
