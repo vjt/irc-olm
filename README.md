@@ -84,8 +84,9 @@ def dispatch(result):
     # dispatch its Result under one lock when several threads use it.
     refused = pacer.submit_all(result.outbound, result.urgent)
     engine.discard([msgid for _, msgid in refused])
-    for nick, _ in refused:
-        report_lost(nick)                # the pacer's queue for it was full
+    for nick, msgid in refused:
+        if msgid not in result.urgent:   # a refused CHAL ends as ChallengeExpired
+            report_lost(nick)            # the pacer's queue for it was full
     for event in result.events:
         handle(event)                    # Received, KeyAlarm, AckOk, ...
 
@@ -94,8 +95,12 @@ def dispatch(result):
 if framing.is_e2e(body):
     dispatch(engine.receive(nick, body))
 
-# Outbound:
-dispatch(engine.send("vjt", {"t": "text", "body": "ciao"}))
+# Outbound. Ask the pacer first: a message it refuses was encrypted all the
+# same, and the receiver skips its key when a CHAL overtakes the queue.
+if pacer.room("vjt"):
+    dispatch(engine.send("vjt", {"t": "text", "body": "ciao"}))
+else:
+    report_lost("vjt")
 
 # About once a second: expires unanswered challenges, reports (SendFailed)
 # messages that waited too long for keys, rotates the fallback key weekly.
@@ -116,10 +121,14 @@ A line the server drops (no such nick, the receiver's CTCP flood limit) or that
 a broken connection eats is lost without an event, like any IRC line. A
 message the pacer refuses, its queue for that nick being full, comes back from
 `submit_all` as `(nick, msgid)`: report it, and hand the msgids to
-`engine.discard()`. What a peer receives and cannot decrypt, it NACKs, and the
+`engine.discard()`. Only messages that carried text come back: a refused
+KEYREQ, KEYS or NACK is logged, and the protocol recovers from it or the
+engine reports what it cost (a `keys-timeout`). A CHAL the pacer could not
+start before it expired is dropped unsent and logged; `ChallengeExpired`
+reports the order. What a peer receives and cannot decrypt, it NACKs, and the
 message is sent once more. A message the global reassembly cap drops (see
 Pacing) is a `Dropped` event with reason `reassembly:global-byte-cap` and the
-nick it came from.
+case-folded nick it came from.
 
 Inner messages are JSON objects with a `t` field: `text`, `action`, `chal` and
 `ack` (SAS messages only ever travel between two cicchettos). `ack` is handled
@@ -204,43 +213,63 @@ that the sender holding the most loses its message furthest from completion
 (on a tie, the sender whose latest message started last), reported as a
 `Dropped` event.
 
-Lines wait in three lanes (`pacing.Lane`):
+Lines wait in three lanes (`pacing.Lane`), and are scheduled by message: once
+a message's first line has left, its other lines go before anything else of
+its rank.
 - **URGENT**: what we originate and cannot wait, a KEYREQ and the messages
   carrying a challenge or an ACK (the engine lists their msgids in
-  `Result.urgent`); a challenge expires in 15 s. They go first, oldest first,
-  so one message's lines stay together. Nothing holds them back: no peer can
-  make us originate more than a KEYREQ a minute.
-- **REACTIVE**: what a peer draws from us, KEYS and NACK. Anyone holding a
-  pinned nick can draw them (a KEYS for each KEYREQ, at most one per 15 s; a
-  NACK for each junk line), so each target's go ahead of text only within 10 s
-  of flood bank a minute (a KEYS and a NACK), taking turns by target; past it
-  they wait behind the text. With n holders of pinned nicks flooding us, text
-  keeps 60 - 10n s of bank a minute.
-- **TEXT**: turns go to the target served longest ago, and a target's text
-  keeps its order, so a short message never overtakes a long one sent before
-  it. A target is its case-folded nick.
+  `Result.urgent`). They go first, within 40 s of flood bank per target per
+  minute: four orders, or a first contact and three. A peer can draw these
+  too, since the bot challenges every line a pinned human addresses to it,
+  and a human chatting with it would otherwise take the whole bank. A
+  challenge carries its deadline (the engine hands the pacer the seconds it
+  has left) and is dropped unsent past it.
+- **REACTIVE**: what a peer draws from us, KEYS and NACK (a KEYS for each
+  KEYREQ, at most one per 15 s; a NACK for each junk line). They go ahead of
+  text within 14 s of bank per target per minute (four NACKs and a KEYS, the
+  recovery after a lost session, or a KEYS and a retry's) and 30 s for all
+  targets together. Past the latter only a target that drew nothing in the
+  last minute goes ahead, an honest peer rather than a flooder. Measured: with
+  1, 2, 3 and 6 to 15 holders of pinned nicks flooding us at the most the
+  engine answers, text keeps 47, 35, 30 and about 25 s of bank a minute; with
+  up to six, an honest peer's KEYS takes 3 to 7 s.
+- **TEXT**: no budget.
+
+Past its budget an urgent or reactive message waits behind the text. Turns go
+to the target served longest ago, in every lane, so one target's messages do
+not hold another's back: a human chatting with the bot (a challenge for each
+line, more than the bank drains) gets four orders a minute through, another
+human's order still leaves within 7 s, and text keeps about 20 s of bank a
+minute. Within a target each lane keeps its order, so a short message never
+overtakes a long one sent before it. A target is its case-folded nick.
 
 REACTIVE and TEXT lines never take the bank past 5 s (a full line, 6 s, goes
 at an empty bank). The rest is kept for URGENT lines, at no cost in throughput
 (the bank drains a second a second either way): behind a stream of text, a
 challenge on an established session (two lines) leaves within 7 s, a first
-challenge (a pre-key message, three lines) within 12 s, and flooders change
-neither. The application's own lines are charged, not held back: a bot that
-talks hard eats into the reserve too.
+challenge (a pre-key message, three lines) within 12 s, whatever flooders do.
+Both bounds assume no other urgent message queued ahead and no line of the
+application's own in the last 10 s, each of which adds its cost; and the 15 s
+of a challenge (14 to 15: it expires at a whole second) run from
+`challenge()`, so on first contact they also cover the KEYREQ and the KEYS
+coming back. The application's lines are charged, not held back. The reserve
+also costs a KEYS's second line about 3 s on an idle connection.
 
 The queues are bounded. Each message is queued or refused whole (half a
-fragmented message is worse than none), and `submit_all` returns the refused
-ones:
+fragmented message is worse than none):
 - queued text, all targets together, may cost at most 480 s of flood bank (80
   to 96 full lines). With a third of the bank left to text (the rest to three
-  flooders and the bot talking at a sixth of its bank) it leaves in 24
+  flooders and the bot talking at a tenth of its bank) it leaves in 20
   minutes, and a NACK finds the plaintext: the engine keeps it 30 minutes, and
   at most 1200 messages, what the bank lets out in that time. A bot taking
   more of its bank for itself can outrun that; a late NACK is then a `Dropped`
   `unknown-nack-ref`;
-- at most 32 text messages per target. An urgent message overtakes them, and
-  the receiver's Olm skips a message key for each one overtaken; vodozemac
-  keeps 40;
+- at most 32 text messages per target, counting the Olm messages refused or
+  dropped behind them while text is queued. An urgent message overtakes the
+  queue, and the receiver's Olm skips a message key for each message
+  overtaken and each refused one (it was encrypted all the same); vodozemac
+  keeps 40. `room(nick)` says whether a text message fits: ask it before
+  `engine.send()`;
 - at most 32 lines per target in each of the URGENT and REACTIVE lanes.
 
 A `send` that raises is logged and the thread carries on.

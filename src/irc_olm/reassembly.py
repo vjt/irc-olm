@@ -58,9 +58,9 @@ class Reassembler:
         self._evicted: list[tuple[str, Rejected]] = []
 
     def take_evicted(self) -> list[tuple[str, Rejected]]:
-        """(sender, rejection) for the messages of OTHER senders the global
-        cap dropped since the last call; the feeding sender's own comes back
-        from feed()."""
+        """(sender, rejection) for every message the global cap dropped since
+        the last call, except the one being fed, which feed() returns. The
+        sender is the key feed() was given (the engine's: the folded nick)."""
         out, self._evicted = self._evicted, []
         return out
 
@@ -112,7 +112,7 @@ class Reassembler:
         the one whose latest message started last), its message furthest
         from completion. Not the idlest: paced, an honest long message is
         it, and the one closest to done. True when that dropped the message
-        being fed; the others wait in take_evicted()."""
+        being fed; every other drop waits in take_evicted()."""
         held = {sender: sum(p.size for p in mine.values()) for sender, mine in self._pending.items()}
         total, mine = sum(held.values()), False
         while total > self.max_bytes_total:
