@@ -11,13 +11,16 @@ Per connection, for the SENDER: every line costs its sender `2 + bytes/120`
 seconds of fake lag, the server parses a client's lines only while that bank
 is under 10 s, and more than 2560 unparsed bytes disconnect it with "Excess
 Flood" (src/parse.c, src/s_bsd.c; tests/fakelag_model.py). A full E2E line
-costs 5 s, so without the bank 3 lines per 6 s gets a long sender killed at
-about the 14th line. A line is released only when the bank plus its cost
-stays at or under 10 s, so no line ever waits unparsed on the server; a long
-message then takes minutes (vjt's ruling on grappa-irc 2430, option A).
+costs 5 s, so without the bank 3 lines per 6 s gets a long sender killed:
+measured on a testnet bahamut at the 12th full line (grappa-irc 2430). A line
+is released only when the bank plus its cost stays at or under 10 s, so no
+line ever waits unparsed on the server; a long message then takes minutes
+(vjt's ruling on grappa-irc 2430, option A).
 
-Single-line messages (KEYREQ, NACK, a CHAL, an ACK) go out ahead of the
-remaining fragments of longer ones, or a CHAL could expire in the queue.
+Urgent messages go out ahead of text: KEYREQ, KEYS and NACK, and the messages
+the engine marks for carrying a CHAL or an ACK (Result.urgent), or a CHAL
+could expire in the queue. Text keeps its order: a short message never
+overtakes a long one sent before it, which its reader would see reversed.
 """
 
 from __future__ import annotations
@@ -33,9 +36,10 @@ from . import framing
 
 DEFAULT_MAX_LINES = 3
 DEFAULT_WINDOW = 6.0
-# Lines waiting per target. At 3 lines per 6 s that is about 17 minutes of
-# backlog: past it, whatever is generating the lines is broken or hostile.
-DEFAULT_MAX_QUEUE = 512
+# Queued text, all targets, in seconds of flood bank: 96 full lines. It must
+# drain, and a NACK come back, while the engine still remembers what it sent
+# (engine.SENT_MEMORY); past it, whatever is generating the text is broken.
+DEFAULT_MAX_BACKLOG = 480.0
 
 FAKE_LAG_CEILING = 10.0
 
@@ -89,33 +93,35 @@ class Pacer:
     given a FakeLag, never past the connection's flood bank.
 
     Pure scheduling, no threads and no clock of its own: the caller asks what
-    is due at a given time. Single-line messages go before the fragments of
-    longer ones; otherwise lines go in the order they were submitted, and a
-    message's own fragments always keep theirs. `fakelag=None` paces per
-    target only, which is not enough on a real connection.
+    is due at a given time. Urgent lines go before text; otherwise lines go
+    in the order they were submitted. `fakelag=None` paces per target only,
+    which is not enough on a real connection.
     """
 
     def __init__(self, max_lines: int = DEFAULT_MAX_LINES, window: float = DEFAULT_WINDOW,
-                 max_queue: int = DEFAULT_MAX_QUEUE, *, fakelag: FakeLag | None):
+                 max_backlog: float = DEFAULT_MAX_BACKLOG, *, fakelag: FakeLag | None):
         self.max_lines = max_lines
         self.window = window
-        self.max_queue = max_queue
+        self.max_backlog = max_backlog
         self.fakelag = fakelag
         self._seq = count()
-        # target -> (single-line messages, everything else), each [(seq, line)]
+        # target -> (urgent, text), each [(seq, line)]
         self._queues: dict[str, tuple[deque, deque]] = {}
+        self._text_cost = 0           # flood bank the queued text will cost
         self._sent: dict[str, deque[float]] = {}
 
-    def submit(self, target: str, lines: list[str]) -> bool:
-        """Queue `lines` for `target`, all or nothing: False (nothing queued)
-        when they would take the target past `max_queue`. Half a fragmented
-        message is worse than none."""
-        if self._queued(target) + len(lines) > self.max_queue:
+    def submit(self, target: str, lines: list[str], *, urgent: bool) -> bool:
+        """Queue `lines` for `target`. Urgent lines are always taken: the
+        protocol's own are rate-limited at the source. Text is all or
+        nothing, False (nothing queued) when it would take the queued text
+        past `max_backlog`: half a fragmented message is worse than none."""
+        cost = sum(self._cost(target, line) for line in lines)
+        if not urgent and self._text_cost + cost > self.max_backlog:
             return False
-        single, rest = self._queues.setdefault(target, (deque(), deque()))
-        for line in lines:
-            frag = framing.parse(line)
-            (single if frag is not None and frag.total == 1 else rest).append((next(self._seq), line))
+        lane = self._queues.setdefault(target, (deque(), deque()))[0 if urgent else 1]
+        lane.extend((next(self._seq), line) for line in lines)
+        if not urgent:
+            self._text_cost += cost
         return True
 
     def _queued(self, target: str) -> int:
@@ -134,8 +140,8 @@ class Pacer:
 
     def _head(self, target: str):
         """(lane, seq, line, queue) of the line `target` would send next."""
-        single, rest = self._queues[target]
-        q, lane = (single, 0) if single else (rest, 1)
+        urgent, text = self._queues[target]
+        q, lane = (urgent, 0) if urgent else (text, 1)
         seq, line = q[0]
         return lane, seq, line, q
 
@@ -144,8 +150,11 @@ class Pacer:
 
     def due(self, now: float) -> list[tuple[str, str]]:
         """Release what may go now, charging it to the bank. Strictly in
-        (single-line first, then submission) order: the first line the bank
-        has no room for stops everything after it, so nothing starves."""
+        (urgent first, then submission) order: the first line the bank has no
+        room for stops everything after it, so nothing starves."""
+        for t in [t for t, sent in self._sent.items()
+                  if t not in self._queues and (not sent or sent[-1] <= now - self.window)]:
+            del self._sent[t]           # a target gone quiet leaves nothing behind
         out = []
         while True:
             ready = sorted((self._head(t)[:2], t) for t in self._queues
@@ -153,13 +162,15 @@ class Pacer:
             if not ready:
                 break
             target = ready[0][1]
-            _, _, line, q = self._head(target)
+            lane, _, line, q = self._head(target)
             cost = self._cost(target, line)
             if self.fakelag is not None:
                 if self.fakelag.room_at(cost, now) > now:
                     break
                 self.fakelag.add(cost, now)
             q.popleft()
+            if lane:
+                self._text_cost -= cost
             self._sent[target].append(now)
             out.append((target, line))
             if not self._queued(target):
@@ -192,23 +203,24 @@ class PacedSender:
         self._thread = threading.Thread(target=self._run, name="irc-olm-pacer", daemon=True)
         self._thread.start()
 
-    def submit(self, target: str, lines: list[str]) -> bool:
+    def submit(self, target: str, lines: list[str], *, urgent: bool) -> bool:
         with self._cv:
-            ok = self._pacer.submit(target, lines)
+            ok = self._pacer.submit(target, lines, urgent=urgent)
             self._cv.notify()
         if not ok:
-            log.warning("pacer queue for %s full: %d lines refused", target, len(lines))
+            log.warning("pacer backlog full: %d lines to %s refused", len(lines), target)
         return ok
 
-    def submit_all(self, outbound: list[tuple[str, str]]) -> int:
-        """Submit an Engine Result's (target, body) pairs, order kept per
-        target, each target's lines all or nothing. Returns the number of
-        lines refused (logged)."""
-        by_target: dict[str, list[str]] = {}
+    def submit_all(self, outbound: list[tuple[str, str]], urgent: set[str]) -> int:
+        """Submit an Engine Result: `submit_all(result.outbound, result.urgent)`.
+        Order is kept per target and lane, each target's text all or nothing.
+        Returns the number of lines refused (logged)."""
+        batches: dict[tuple[str, bool], list[str]] = {}
         for target, body in outbound:
-            by_target.setdefault(target, []).append(body)
-        return sum(len(lines) for target, lines in by_target.items()
-                   if not self.submit(target, lines))
+            frag = framing.parse(body)
+            batches.setdefault((target, frag is not None and frag.msgid in urgent), []).append(body)
+        return sum(len(lines) for (target, lane_urgent), lines in batches.items()
+                   if not self.submit(target, lines, urgent=lane_urgent))
 
     def _run(self) -> None:
         while True:

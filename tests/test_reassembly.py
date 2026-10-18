@@ -133,3 +133,19 @@ def test_an_incomplete_message_is_discarded_60s_after_its_last_fragment():
     clock.t += 60.5
     for f in fs[2:]:
         assert r.feed("vjt", f) is None
+
+
+def test_buffered_bytes_are_capped_across_senders_oldest_first():
+    # Pending messages live 60 s from their LAST fragment: one fragment a
+    # minute keeps one alive, so a nick-changing sender needs a global cap.
+    r, clock = make(max_bytes_total=1500)
+    msgs = []
+    for i in range(6):
+        _, fs = frags(600)                        # 2 fragments: ~460 bytes buffered each
+        assert len(fs) == 2 and 3 * len(fs[0].chunk) <= 1500 < 4 * len(fs[0].chunk)
+        assert r.feed(f"nick{i}", fs[0]) is None
+        msgs.append(fs)
+        clock.t += 1
+    assert r.feed("nick0", msgs[0][1]) is None    # evicted: its rest starts over
+    assert isinstance(r.feed("nick5", msgs[5][1]), Assembled)
+    assert isinstance(r.feed("nick4", msgs[4][1]), Assembled)

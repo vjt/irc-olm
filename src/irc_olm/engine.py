@@ -55,6 +55,7 @@ SENT_MEMORY = 600.0          # plaintexts kept for a re-send after a NACK. Under
                              # line every ~5 s: its NACK comes minutes after send()
 MAX_SENDS = 2                # a message goes out at most twice: once, and once
                              # more on a fresh session after a NACK
+URGENT_INNER = ("chal", "ack")  # inner types that must not wait behind text
 MAX_SESSIONS_PER_PEER = 5
 SEEN_SESSIONS_MAX = 10_000
 FALLBACK_ROTATE = 7 * 86400  # vodozemac keeps the previous one: a fallback key
@@ -192,22 +193,33 @@ class ChallengeExpired:
 class Result:
     events: list = field(default_factory=list)
     outbound: list[tuple[str, str]] = field(default_factory=list)
+    # msgids of the outbound messages that go ahead of text (pacing): the
+    # KEYREQ/KEYS/NACK of the protocol, and the messages carrying a CHAL or
+    # an ACK, which expire in 15 s.
+    urgent: set[str] = field(default_factory=set)
 
     def extend(self, other: "Result") -> "Result":
         self.events.extend(other.events)
         self.outbound.extend(other.outbound)
+        self.urgent |= other.urgent
         return self
 
 
 # --- internals ---------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _Outgoing:
+    plaintext: bytes = field(repr=False)
+    urgent: bool     # a CHAL or an ACK: ahead of text in the pacer
+    sends: int       # 1 for a first send, 2 for a re-send after a NACK
+
+
 @dataclass
 class _Queued:
     nick: str
     ed25519: str     # the key it was meant for: it never goes to another one
-    plaintext: bytes = field(repr=False)
+    msg: _Outgoing
     at: float
-    sends: int       # 1 for a first send, 2 for a re-send after a NACK
 
 
 @dataclass
@@ -215,9 +227,8 @@ class _Sent:
     nick: str
     ed25519: str
     session_id: str
-    plaintext: bytes = field(repr=False)
+    msg: _Outgoing
     at: float
-    sends: int
 
 
 class Engine:
@@ -336,24 +347,25 @@ class Engine:
             except (TypeError, ValueError):
                 res.events.append(SendFailed(nick, "unencodable", 1))
                 return res
-            self._send_to(nick, peer, plaintext, 1, res)
+            urgent = isinstance(inner, dict) and inner.get("t") in URGENT_INNER
+            self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1), res)
             return res
 
-    def _send_to(self, nick: str, peer: Peer, plaintext: bytes, sends: int, res: Result) -> None:
+    def _send_to(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
         # While keys are asked for (first contact, or a re-key after a NACK)
         # the sessions we still hold are the ones that failed: wait.
         if self._sessions.get(peer.curve25519) and fold(nick) not in self._keyreq_at:
-            self._encrypt(nick, peer, plaintext, sends, res)
+            self._encrypt(nick, peer, msg, res)
         else:
-            self._enqueue(nick, peer, plaintext, sends, res)
+            self._enqueue(nick, peer, msg, res)
 
-    def _enqueue(self, nick: str, peer: Peer, plaintext: bytes, sends: int, res: Result) -> None:
+    def _enqueue(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
         key = fold(nick)
         q = self._live_queue(key, res)
         if len(q) >= OUTQ_MAX:
             res.events.append(SendFailed(nick, "queue-full", 1))
             return
-        q.append(_Queued(nick, peer.ed25519, plaintext, self._now(), sends))
+        q.append(_Queued(nick, peer.ed25519, msg, self._now()))
         self._outq[key] = q
         res.events.append(SendQueued(nick, len(q)))
         self._maybe_keyreq(nick, peer, res)
@@ -374,13 +386,11 @@ class Engine:
         if last is not None and self._now() - last < KEYREQ_RETRY:
             return
         self._keyreq_at[key] = self._now()
-        self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res)
+        self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res, urgent=True)
 
-    def _encrypt(self, nick: str, peer: Peer, plaintext: bytes, sends: int,
-                 res: Result) -> None:
+    def _encrypt(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
         session = self._sessions[peer.curve25519][0]
-        msg = session.encrypt(plaintext)
-        mtype, ct = msg.to_parts()
+        mtype, ct = session.encrypt(msg.plaintext).to_parts()
         if mtype == 0:
             verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self.identity, "body": b64u(ct)}
         else:
@@ -388,22 +398,23 @@ class Engine:
                                     "body": b64u(ct)}
         self._save()
         try:
-            msgid = self._emit(nick, verb, payload, res)
+            msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent)
         except PayloadError:
             # More than 64 fragments. The session has moved on by one
             # message, which the peer's Olm skips over.
             res.events.append(SendFailed(nick, "too-long", 1))
             return
-        self._sent[msgid] = _Sent(nick, peer.ed25519, session.session_id, plaintext,
-                                  self._now(), sends)
+        self._sent[msgid] = _Sent(nick, peer.ed25519, session.session_id, msg, self._now())
         self._trim_sent()
 
-    def _emit(self, nick: str, verb: str, payload: dict, res: Result) -> str:
+    def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, urgent: bool) -> str:
         mask = self.own_mask or framing.conservative_mask(self.nick, self.ident)
         msgid = framing.new_msgid()
         for body in framing.fragment(verb, framing.encode_payload(payload), own_mask=mask,
                                      target=nick, linelen=self.linelen, msgid=msgid):
             res.outbound.append((nick, body))
+        if urgent:
+            res.urgent.add(msgid)
         return msgid
 
     # --- receiving ---------------------------------------------------------------
@@ -469,7 +480,8 @@ class Engine:
             self._save()
         else:
             entry = {"key": self._fallback["key"], "fallback": True, "sig": self._fallback["sig"]}
-        self._emit(nick, "KEYS", {"v": WIRE_VERSION, "id": self.identity, "otk": entry}, res)
+        self._emit(nick, "KEYS", {"v": WIRE_VERSION, "id": self.identity, "otk": entry}, res,
+                   urgent=True)
 
     def _on_keys(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         key = fold(nick)
@@ -501,7 +513,7 @@ class Engine:
         self._add_session(peer.curve25519, session)
         self._rekey_at[peer.ed25519] = self._now()
         for q in mine:
-            self._encrypt(nick, peer, q.plaintext, q.sends, res)
+            self._encrypt(nick, peer, q.msg, res)
 
     def _on_pkmsg(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         peer = self._identify(nick, payload["id"], res, proving=True)
@@ -607,7 +619,7 @@ class Engine:
         if not self._reached_at(nick, peer):
             res.events.append(SendFailed(nick, "repinned", 1))
             return
-        if sent.sends >= MAX_SENDS:
+        if sent.msg.sends >= MAX_SENDS:
             res.events.append(SendFailed(nick, "resend-failed", 1))
             return
         lst = self._sessions.get(peer.curve25519) or []
@@ -616,7 +628,7 @@ class Engine:
             # for (a re-key for an earlier NACK of the same burst, say): re-send
             # on the newest, or queue behind the keys. No new session.
             self._drop_session(peer.curve25519, sent.session_id)
-            return self._send_to(nick, peer, sent.plaintext, sent.sends + 1, res)
+            return self._send_to(nick, peer, replace(sent.msg, sends=sent.msg.sends + 1), res)
         # The failed session is our newest: only a new one helps, and the
         # spec allows one per peer per minute.
         last = self._rekey_at.get(peer.ed25519)
@@ -627,7 +639,7 @@ class Engine:
         res.events.append(Rekeying(nick, peer))
         # Re-send the lost message on the new session (the spec's MAY).
         self._keyreq_at.pop(fold(nick), None)
-        self._enqueue(nick, peer, sent.plaintext, sent.sends + 1, res)
+        self._enqueue(nick, peer, replace(sent.msg, sends=sent.msg.sends + 1), res)
 
     def _undecryptable(self, nick: str, msgid: str, reason: str, peer: Peer,
                        res: Result) -> None:
@@ -638,7 +650,7 @@ class Engine:
         a message without a NACK is lost without a word."""
         res.events.append(Undecryptable(nick, msgid, reason))
         if self._reached_at(nick, peer):
-            self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res)
+            self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res, urgent=True)
 
     def _reached_at(self, nick: str, peer: Peer) -> bool:
         """Whether sending to `nick` reaches `peer`'s key."""
