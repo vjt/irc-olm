@@ -183,27 +183,38 @@ Two limits, both from bahamut (Azzurra):
   while that bank is under 10 s, and more than 2560 unparsed bytes disconnect
   it ("Excess Flood"). A full E2E line costs 5 s, so the per-target window
   alone gets a long sender killed: at the 12th full line, measured on a
-  testnet bahamut (grappa-irc#2430). `FakeLag` models
-  the bank (the same arithmetic as grappa's), and a line is released only
-  when the bank plus its cost stays at or under 10 s, so no line ever waits
-  unparsed on the server. The bank must see every line on the connection:
-  the pacer charges its own, the application charges the rest.
-  `tests/fakelag_model.py` ports the server side.
+  testnet bahamut (grappa-irc#2430). `FakeLag` models the bank (the same
+  arithmetic as grappa's), and a line is released only when the bank plus its
+  cost stays at or under 10 s. The bank must see every line on the
+  connection: the pacer charges its own, the application charges the rest
+  (the application's own lines are charged, not held back, so a bot talking
+  hard can still fill the bank itself). `tests/fakelag_model.py` ports the
+  server side.
 
 A long message is therefore slow: 64 full lines take over five minutes, and
 receivers keep a partial message for 60 s after its LAST fragment (vjt's
 ruling on grappa-irc#2430), buffering at most 512 KB across all senders.
 Urgent messages go out ahead of text: KEYREQ, KEYS, NACK, and the messages
 carrying a challenge or an ACK (the engine lists their msgids in
-`Result.urgent`), so a challenge does not expire in the queue. Text keeps its
-order, so a short message never overtakes a long one sent before it.
+`Result.urgent`), so a challenge does not expire in the queue. A target may
+send 8 urgent lines a minute that way; past that, its urgent lines wait their
+turn with the text, so a peer flooding us with KEYREQs and junk (each drawing
+an urgent answer) takes its share of the bank and no more. Turns go to the
+target served longest ago. Text keeps its order, so a short message never
+overtakes a long one sent before it. A target is its case-folded nick.
 
-Queued text, all targets together, may cost at most 480 s of flood bank (96
-full lines). It must leave, and a NACK come back, while the engine still
-remembers the plaintext for a re-send (10 minutes). Text past that is refused
-whole and logged, since half a fragmented message is worse than none; urgent
-lines are always taken. A `send` that raises is logged and the thread carries
-on.
+The queues are bounded, and a batch past a bound is refused whole and logged
+(half a fragmented message is worse than none):
+- queued text, all targets together, may cost at most 480 s of flood bank (96
+  full lines). It must leave, and a NACK come back, while the engine still
+  remembers the plaintext for a re-send: 30 minutes, at most 512 messages,
+  enough with the bot talking meanwhile;
+- at most 32 text messages per target. An urgent message overtakes them, and
+  the receiver's Olm skips a message key for each one overtaken; vodozemac
+  keeps 40;
+- at most 32 urgent lines per target.
+
+A `send` that raises is logged and the thread carries on.
 
 ## Tests
 

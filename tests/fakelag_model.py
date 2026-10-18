@@ -1,6 +1,7 @@
 """A port of bahamut's per-client flood bank and Excess Flood, for pacing tests.
 
-azzurra/bahamut (the tree vendored in grappa-irc): every PRIVMSG/NOTICE adds
+azzurra/bahamut (the tree vendored in grappa-irc): every line (every command
+flagged 1 in msgtab: PRIVMSG, NOTICE, NICK, JOIN, MODE, PING, PONG, ...) adds
 `2 + params/120` seconds to the client's `since` (src/parse.c:236; `params` is
 the line after the command word, CRLF excluded); a read sets
 `since = max(since, now)` (src/s_bsd.c:1758); the client's recvQ is parsed only

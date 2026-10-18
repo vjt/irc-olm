@@ -178,19 +178,23 @@ def test_text_past_the_connections_backlog_is_refused_whole_and_control_never_is
 
 from fakelag_model import ServerModel  # noqa: E402
 from irc_olm import framing  # noqa: E402
-from irc_olm.pacing import DEFAULT_WINDOW, FakeLag  # noqa: E402
+from irc_olm.pacing import (DEFAULT_MAX_TEXT_MESSAGES, DEFAULT_MAX_URGENT,  # noqa: E402
+                            DEFAULT_WINDOW, FakeLag)
 
 FULL = "x" * (400 - len("PRIVMSG vjt :"))      # a full E2E line, 400 bytes before CRLF
 
 
 def run_against_server(p, t0=1000.0, step=0.05, until=900.0, also=()):
     """Drain the pacer into the server model; `also` = [(t, line)] the
-    application writes itself at those times (already charged by the caller)."""
+    application writes itself at those times, charging its bank then."""
     server, out, extra = ServerModel(), [], sorted(also)
     for k in range(int(until / step)):
         t = t0 + k * step
         while extra and extra[0][0] <= t:
-            server.arrive(extra.pop(0)[1], int(t))
+            line = extra.pop(0)[1]
+            if p.fakelag is not None:
+                p.fakelag.charge(line, t)
+            server.arrive(line, int(t))
         for target, body in p.due(t):
             out.append((t, target, body))
             server.arrive(f"PRIVMSG {target} :{body}", int(t))
@@ -228,8 +232,8 @@ def test_three_lines_per_six_seconds_alone_get_a_long_sender_killed():
 
 
 def test_with_the_bank_no_line_ever_waits_unparsed_on_the_server():
-    p = Pacer(fakelag=FakeLag())
-    p.submit("vjt", [FULL] * 64, urgent=False)
+    p = Pacer(max_text_messages=64, fakelag=FakeLag())   # bare lines: one message each
+    assert p.submit("vjt", [FULL] * 64, urgent=False)
     server, out = run_against_server(p)
     assert server.killed_at is None
     assert server.max_backlog == 0
@@ -239,10 +243,7 @@ def test_with_the_bank_no_line_ever_waits_unparsed_on_the_server():
 
 def test_lines_the_application_writes_count_in_the_same_bank():
     def last_e2e_line_at(talk):
-        lag = FakeLag()
-        for t, line in talk:
-            lag.charge(line, t)       # the application charges what it writes itself
-        p = Pacer(fakelag=lag)
+        p = Pacer(fakelag=FakeLag())
         p.submit("vjt", [FULL] * 20, urgent=False)
         server, out = run_against_server(p, also=talk)
         assert server.killed_at is None and server.max_backlog == 0
@@ -294,17 +295,6 @@ def test_submit_all_puts_the_engines_urgent_messages_in_the_fast_lane():
         assert [line for _, line in pacer.due(1006.0)] == chal[1:]   # for a 5 s long line
 
 
-def test_text_the_pacer_accepts_leaves_while_the_engine_still_remembers_it():
-    # A NACK can only re-send what the engine still remembers: a full text
-    # backlog must drain, and the peer's NACK come back, within SENT_MEMORY.
-    from irc_olm.engine import SENT_MEMORY
-    p = Pacer(fakelag=FakeLag())
-    while p.submit("vjt", [FULL], urgent=False):
-        pass
-    _, out = run_against_server(p, until=SENT_MEMORY * 2)
-    assert out[-1][0] - out[0][0] + 60 <= SENT_MEMORY
-
-
 def test_an_idle_target_leaves_nothing_behind():
     p = Pacer(fakelag=None)
     for i in range(50):
@@ -332,3 +322,98 @@ def test_a_bank_without_room_sets_the_next_wakeup_instead_of_spinning():
     assert len(p.due(1000.0)) == 2            # 5 s + 5 s: the bank is full
     assert p.due(1000.0) == []
     assert p.next_wakeup(1000.0) == 1005.0    # room for the third line, not "now"
+
+
+# --- review of the fake-lag branch ---------------------------------------
+
+def test_with_lines_queued_the_next_wakeup_is_never_now_when_nothing_is_due():
+    # A wakeup at `now` with nothing due is a busy loop in PacedSender.
+    rng = random.Random(7)
+    for _ in range(300):
+        lag = FakeLag()
+        p = Pacer(fakelag=lag)
+        now = 1000.0
+        lag.add(rng.choice([0, 3, 6, 9]), now)
+        for i in range(rng.randint(1, 6)):
+            target = rng.choice(["a", "b", "c"])
+            p.submit(target, ["x" * rng.choice([10, 200, 380])] * rng.randint(1, 3),
+                     urgent=rng.random() < 0.3)
+        for _ in range(40):
+            p.due(now)
+            if not p.pending():
+                break
+            wake = p.next_wakeup(now)
+            assert wake is not None and wake > now
+            now = wake
+
+
+def test_an_empty_batch_is_accepted_and_breaks_nothing():
+    p = Pacer(fakelag=FakeLag())
+    assert p.submit("vjt", [], urgent=False) is True
+    assert p.submit("vjt", [], urgent=True) is True
+    assert p.due(1000.0) == [] and p.next_wakeup(1000.0) is None and p.pending() == 0
+    p.submit("vjt", ["x"], urgent=False)
+    assert [line for _, line in p.due(1000.0)] == ["x"]
+
+
+def test_one_nick_spelt_two_ways_is_one_target_for_the_window():
+    p = Pacer(fakelag=None)
+    p.submit("Bob", ["1", "2", "3"], urgent=False)
+    p.submit("bob", ["4", "5", "6"], urgent=False)
+    assert [t for t, _ in p.due(1000.0)] == ["Bob", "Bob", "Bob"]   # each line keeps its spelling
+
+
+def test_a_target_flooding_us_with_urgent_lines_cannot_starve_the_others():
+    # Whoever holds a pinned nick can draw a KEYS every 30 s and a NACK per
+    # junk line: its urgent lines must not hold everyone else's back.
+    p = Pacer(fakelag=FakeLag())
+    t0, left = 1000.0, {}
+    p.submit("c", [FULL] * 3, urgent=False)
+    for k in range(int(120 / 0.5)):
+        now = t0 + k * 0.5
+        if k % 2 == 0:
+            p.submit("mal", ["n" * 300], urgent=True)       # one urgent line a second
+        if k == 20:
+            p.submit("lucy", ["chal" + "c" * 300] * 2, urgent=True)
+        for target, line in p.due(now):
+            left.setdefault(target, []).append(now - t0)
+    assert len(left.get("c", [])) == 3 and left["c"][-1] < 60
+    assert left["lucy"][-1] - 10 < 15                         # a CHAL submitted at 10 s
+
+
+def test_a_targets_urgent_queue_is_capped():
+    p = Pacer(fakelag=FakeLag())
+    assert p.submit("mal", ["n"] * DEFAULT_MAX_URGENT, urgent=True) is True
+    assert p.submit("mal", ["n"], urgent=True) is False
+    assert p.submit("vjt", ["n"], urgent=True) is True
+
+
+def test_text_queued_for_one_target_stays_within_what_olm_can_skip():
+    # An urgent message overtakes the target's queued text: the receiver
+    # skips one message key per message overtaken, and keeps only so many.
+    p = Pacer(fakelag=FakeLag())
+    msgs = [_message(1) for _ in range(DEFAULT_MAX_TEXT_MESSAGES)]
+    for m in msgs:
+        assert p.submit("vjt", m, urgent=False) is True
+    assert p.submit("vjt", _message(1), urgent=False) is False
+    assert p.submit("lucy", _message(1), urgent=False) is True
+    p.due(1000.0)                                             # one message leaves
+    assert p.submit("vjt", _message(1), urgent=False) is True
+
+
+def test_text_accepted_leaves_within_sent_memory_on_a_talking_connection():
+    # The bot keeps talking in channels meanwhile (charged to the same bank).
+    from irc_olm.engine import SENT_MEMORY
+    p = Pacer(fakelag=FakeLag())
+    while p.submit("vjt", _message(1), urgent=False) and p._text_cost < p.max_backlog - 5:
+        p.submit("lucy", _message(1), urgent=False)            # two targets: past 32 each
+    chatter = [(1000.0 + 4 * i, "PRIVMSG #sbiffo :" + "y" * 100) for i in range(1000)]
+    _, out = run_against_server(p, until=SENT_MEMORY * 2, also=chatter)
+    assert out[-1][0] - out[0][0] + 60 <= SENT_MEMORY
+
+
+def test_fakelag_checks_and_charges_in_one_step():
+    lag = FakeLag()
+    assert lag.try_add(6, 1000.0) is True
+    assert lag.try_add(5, 1000.0) is False and lag.bank(1000.0) == 6.0
+    assert lag.try_add(4, 1000.0) is True and lag.bank(1000.0) == 10.0
