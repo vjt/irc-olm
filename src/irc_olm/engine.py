@@ -27,6 +27,7 @@ from typing import Callable
 import vodozemac as vz
 
 from . import framing
+from .challenge import Challenge, ChallengeBook, new_challenge
 from .framing import PayloadError
 from .reassembly import Assembled, Reassembler, Rejected
 from .store import StateFile
@@ -51,6 +52,10 @@ SEEN_SESSIONS_MAX = 10_000
 
 class StateMismatchError(ValueError):
     """A state file that belongs to another network."""
+
+
+class NotVerifiedError(ValueError):
+    """An operation that needs a verified key, attempted without one."""
 
 
 def fold(nick: str) -> str:
@@ -148,6 +153,25 @@ class RekeyThrottled:
     peer: Peer
 
 
+@dataclass(frozen=True)
+class AckOk:
+    nick: str
+    peer: Peer
+    challenge: Challenge
+
+
+@dataclass(frozen=True)
+class AckRejected:
+    nick: str
+    peer: Peer
+    reason: str
+
+
+@dataclass(frozen=True)
+class ChallengeExpired:
+    challenge: Challenge
+
+
 @dataclass
 class Result:
     events: list = field(default_factory=list)
@@ -205,6 +229,7 @@ class Engine:
         self._otk_at: dict[str, float] = {}          # folded nick -> last OTK handed out
         self._otk_log: list[float] = []
         self._sent: OrderedDict[str, _Sent] = OrderedDict()
+        self._challenges = ChallengeBook()
 
         doc = self._file.load()
         if doc is None:
@@ -470,7 +495,11 @@ class Engine:
         if not isinstance(inner, dict) or not isinstance(inner.get("t"), str):
             res.events.append(Dropped(nick, "inner-without-type"))
             return
-        res.events.append(Received(nick, self._peers[peer.ed25519], inner))
+        peer = self._peers[peer.ed25519]
+        if inner["t"] == "ack":
+            self._on_ack(nick, peer, inner, res)
+        else:
+            res.events.append(Received(nick, peer, inner))
 
     def _on_nack(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         sent = self._sent.get(payload["ref"])
@@ -502,6 +531,39 @@ class Engine:
             return
         self._nack_at[key] = now
         self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res)
+
+    # --- order challenges ---------------------------------------------------
+
+    def challenge(self, nick: str, *, network: str, channel: str, sender_mask: str,
+                  line: bytes) -> tuple[Challenge, Result]:
+        """Send a CHAL for `line` to the verified key pinned to `nick`.
+        `network` is the 005 NETWORK token; `line` the raw PRIVMSG text."""
+        with self._lock:
+            peer = self.pinned(nick)
+            if peer is None or not peer.verified:
+                raise NotVerifiedError(f"no verified key pinned to {nick!r}")
+            ch = new_challenge(nick=nick, ed25519=peer.ed25519, network=network, channel=channel,
+                               sender_mask=sender_mask, line=line, now=self._now())
+            self._challenges.add(ch)
+            return ch, self.send(nick, ch.inner())
+
+    def _on_ack(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
+        if not peer.verified:
+            res.events.append(AckRejected(nick, peer, "unverified-key"))
+            return
+        ch, reason = self._challenges.check(str(inner.get("nonce")), peer.ed25519, self._now())
+        res.events.append(AckOk(nick, peer, ch) if ch else AckRejected(nick, peer, reason))
+
+    # --- time --------------------------------------------------------------------
+
+    def tick(self) -> Result:
+        """Expire unanswered challenges. Call about once a second."""
+        with self._lock:
+            res = Result()
+            now = self._now()
+            for ch in self._challenges.expire(now):
+                res.events.append(ChallengeExpired(ch))
+            return res
 
     # --- identities and pins -------------------------------------------------
 
