@@ -307,3 +307,19 @@ def test_the_fallback_key_rotates_weekly(net):
     bot.tick()
     net.clock.t += 61
     assert fallback_after_two_keyreqs() != first
+
+
+@pytest.mark.parametrize("bad", ["\ud800", float("nan"), object()])
+def test_an_inner_message_that_cannot_be_encoded_is_a_send_failure(net, bad):
+    from irc_olm.engine import SendFailed
+    bot, vjt = paired(net)
+
+    def refused(res):
+        return [(e.reason, e.lost) for e in res.events if isinstance(e, SendFailed)]
+
+    res = vjt.send("bot", {"t": "text", "body": bad})          # no session yet
+    assert refused(res) == [("unencodable", 1)] and res.outbound == []
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ok"}))
+    assert texts(net.take("bot")) == ["ok"]                       # nothing stuck in the queue
+    res = vjt.send("bot", {"t": "text", "body": bad})          # on an open session
+    assert refused(res) == [("unencodable", 1)] and res.outbound == []
