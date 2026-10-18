@@ -255,12 +255,12 @@ def test_a_replayed_fallback_prekey_message_is_refused_after_a_restart(net):
     assert any(isinstance(e, Replayed) for e in res.events)
 
 
-def test_keyreq_answers_are_rate_limited_per_nick_to_the_keyreq_retry(net):
-    # A KEYS is two lines, 8 s of our flood bank: once per retry, no more.
-    from irc_olm.engine import KEYREQ_RETRY
+def test_keyreq_answers_are_rate_limited_per_nick(net):
+    # A KEYS is two lines, 8 s of our flood bank.
+    from irc_olm.engine import KEYS_INTERVAL
     bot, vjt = paired(net)
     first = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
-    net.clock.t += KEYREQ_RETRY - 1
+    net.clock.t += KEYS_INTERVAL - 1
     second = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
     assert {framing.parse(b).verb for _, b in first.outbound} == {"KEYS"}
     assert second.outbound == []
@@ -419,3 +419,53 @@ def test_olm_decrypts_a_message_that_overtook_as_many_as_the_pacer_lets_queue(ne
             events += bot.receive("vjt", body).events
     assert [e for e in events if isinstance(e, Undecryptable)] == []
     assert len(texts(events)) == DEFAULT_MAX_TEXT_MESSAGES
+
+
+def test_a_retry_keyreq_that_crossed_faster_than_the_first_is_answered(net):
+    # The interval runs from the first KEYREQ's ARRIVAL here, the asker's
+    # retry from its SENDING there: a first KEYREQ that waited 8 s in the
+    # asker's pacer, whose KEYS was then lost, must not cost the retry.
+    from irc_olm.engine import KEYREQ_RETRY, SendFailed
+    bot, vjt = paired(net)
+    r1 = vjt.send("bot", {"t": "text", "body": "one"})
+    net.clock.t += 8
+    assert bot.receive("vjt", r1.outbound[0][1]).outbound        # a KEYS, lost on the way
+    net.clock.t += KEYREQ_RETRY - 8
+    r2 = vjt.send("bot", {"t": "text", "body": "two"})
+    assert [framing.parse(b).verb for _, b in r2.outbound] == ["KEYREQ"]
+    net.pump("bot", bot.receive("vjt", r2.outbound[0][1]))
+    assert [e for e in net.take("vjt") if isinstance(e, SendFailed)] == []
+    assert texts(net.take("bot")) == ["one", "two"]
+
+
+def test_messages_the_pacer_refused_are_forgotten(net):
+    # They never left: no NACK can come for them, and they must not push the
+    # plaintexts of messages still on their way out of the bounded memory.
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "hi"}))
+    sent = bot.send("vjt", {"t": "text", "body": "refused"})
+    (msgid,) = {framing.parse(b).msgid for _, b in sent.outbound}
+    bot.discard([msgid])
+    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": msgid})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
+    assert res.outbound == []
+
+
+def test_a_message_evicted_by_the_global_reassembly_cap_is_reported(net):
+    # Evicted to make room for another sender's fragment: reported, with the
+    # nick it came from, in the Result of the receive that caused it.
+    from irc_olm.reassembly import Reassembler
+    bot, vjt = paired(net)
+    bot._reasm = Reassembler(max_bytes_total=1500, clock=net.clock)
+
+    def frags(size):
+        return framing.fragment("MSG", framing.encode_payload({"v": 1, "body": "x" * size}),
+                                own_mask="x!x@h", target="bot")
+    big = frags(900)
+    assert len(big) == 3
+    for f in big[:2]:
+        assert bot.receive("nick0", f).events == []
+    assert bot.receive("nick1", frags(600)[0]).events == []
+    res = bot.receive("nick2", frags(600)[0])
+    assert [(e.nick, e.reason, e.verb) for e in res.events] == \
+        [("nick0", "reassembly:global-byte-cap", "MSG")]

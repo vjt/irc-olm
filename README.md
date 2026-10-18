@@ -82,7 +82,10 @@ def send_raw(line):  # every OTHER line: registration, PONG, chat
 def dispatch(result):
     # Lines leave in the order the engine produced them: call the engine and
     # dispatch its Result under one lock when several threads use it.
-    pacer.submit_all(result.outbound, result.urgent)
+    refused = pacer.submit_all(result.outbound, result.urgent)
+    engine.discard([msgid for _, msgid in refused])
+    for nick, _ in refused:
+        report_lost(nick)                # the pacer's queue for it was full
     for event in result.events:
         handle(event)                    # Received, KeyAlarm, AckOk, ...
 
@@ -109,11 +112,14 @@ Every failure the engine can see is a `SendFailed` event with a reason
 `nack-from-another-nick`, ...) and the number of messages lost; `send()` never
 raises. `challenge()` raises `NotPinnedError` for a nick without a pinned key:
 ask `pinned()` first, under the same lock. IRC itself has no delivery receipt.
-A line the server drops (no such nick, the receiver's CTCP flood limit), that a
-broken connection eats, or that the pacer refuses (`submit_all` returns how
-many lines it refused, and logs them) is lost without an event, like any IRC
-line. What a peer receives and cannot decrypt, it NACKs, and the message is
-sent once more.
+A line the server drops (no such nick, the receiver's CTCP flood limit) or that
+a broken connection eats is lost without an event, like any IRC line. A
+message the pacer refuses, its queue for that nick being full, comes back from
+`submit_all` as `(nick, msgid)`: report it, and hand the msgids to
+`engine.discard()`. What a peer receives and cannot decrypt, it NACKs, and the
+message is sent once more. A message the global reassembly cap drops (see
+Pacing) is a `Dropped` event with reason `reassembly:global-byte-cap` and the
+nick it came from.
 
 Inner messages are JSON objects with a `t` field: `text`, `action`, `chal` and
 `ack` (SAS messages only ever travel between two cicchettos). `ack` is handled
@@ -181,7 +187,7 @@ Two limits, both from bahamut (Azzurra):
 - **Per connection, for the sender.** Every line costs its sender
   `2 + bytes/120` seconds of fake lag; the server parses a client's lines only
   while that bank is under 10 s, and more than 2560 unparsed bytes disconnect
-  it ("Excess Flood"). A full E2E line costs 5 s, so the per-target window
+  it ("Excess Flood"). A full E2E line costs 5 or 6 s, so the per-target window
   alone gets a long sender killed: at the 12th full line, measured on a
   testnet bahamut (grappa-irc#2430). `FakeLag` models the bank (the same
   arithmetic as grappa's), and a line is released only when the bank plus its
@@ -193,26 +199,49 @@ Two limits, both from bahamut (Azzurra):
 
 A long message is therefore slow: 64 full lines take over five minutes, and
 receivers keep a partial message for 60 s after its LAST fragment (vjt's
-ruling on grappa-irc#2430), buffering at most 512 KB across all senders.
-Urgent messages go out ahead of text: KEYREQ, KEYS, NACK, and the messages
-carrying a challenge or an ACK (the engine lists their msgids in
-`Result.urgent`), so a challenge does not expire in the queue. A target may
-send 8 urgent lines a minute that way; past that, its urgent lines wait their
-turn with the text, so a peer flooding us with KEYREQs and junk (each drawing
-an urgent answer) takes its share of the bank and no more. Turns go to the
-target served longest ago. Text keeps its order, so a short message never
-overtakes a long one sent before it. A target is its case-folded nick.
+ruling on grappa-irc#2430), buffering at most 512 KB across all senders. Past
+that the sender holding the most loses its message furthest from completion
+(on a tie, the sender whose latest message started last), reported as a
+`Dropped` event.
 
-The queues are bounded, and a batch past a bound is refused whole and logged
-(half a fragmented message is worse than none):
-- queued text, all targets together, may cost at most 480 s of flood bank (96
-  full lines). It must leave, and a NACK come back, while the engine still
-  remembers the plaintext for a re-send: 30 minutes, at most 512 messages,
-  enough with the bot talking meanwhile;
+Lines wait in three lanes (`pacing.Lane`):
+- **URGENT**: what we originate and cannot wait, a KEYREQ and the messages
+  carrying a challenge or an ACK (the engine lists their msgids in
+  `Result.urgent`); a challenge expires in 15 s. They go first, oldest first,
+  so one message's lines stay together. Nothing holds them back: no peer can
+  make us originate more than a KEYREQ a minute.
+- **REACTIVE**: what a peer draws from us, KEYS and NACK. Anyone holding a
+  pinned nick can draw them (a KEYS for each KEYREQ, at most one per 15 s; a
+  NACK for each junk line), so each target's go ahead of text only within 10 s
+  of flood bank a minute (a KEYS and a NACK), taking turns by target; past it
+  they wait behind the text. With n holders of pinned nicks flooding us, text
+  keeps 60 - 10n s of bank a minute.
+- **TEXT**: turns go to the target served longest ago, and a target's text
+  keeps its order, so a short message never overtakes a long one sent before
+  it. A target is its case-folded nick.
+
+REACTIVE and TEXT lines never take the bank past 5 s (a full line, 6 s, goes
+at an empty bank). The rest is kept for URGENT lines, at no cost in throughput
+(the bank drains a second a second either way): behind a stream of text, a
+challenge on an established session (two lines) leaves within 7 s, a first
+challenge (a pre-key message, three lines) within 12 s, and flooders change
+neither. The application's own lines are charged, not held back: a bot that
+talks hard eats into the reserve too.
+
+The queues are bounded. Each message is queued or refused whole (half a
+fragmented message is worse than none), and `submit_all` returns the refused
+ones:
+- queued text, all targets together, may cost at most 480 s of flood bank (80
+  to 96 full lines). With a third of the bank left to text (the rest to three
+  flooders and the bot talking at a sixth of its bank) it leaves in 24
+  minutes, and a NACK finds the plaintext: the engine keeps it 30 minutes, and
+  at most 1200 messages, what the bank lets out in that time. A bot taking
+  more of its bank for itself can outrun that; a late NACK is then a `Dropped`
+  `unknown-nack-ref`;
 - at most 32 text messages per target. An urgent message overtakes them, and
   the receiver's Olm skips a message key for each one overtaken; vodozemac
   keeps 40;
-- at most 32 urgent lines per target.
+- at most 32 lines per target in each of the URGENT and REACTIVE lanes.
 
 A `send` that raises is logged and the thread carries on.
 
