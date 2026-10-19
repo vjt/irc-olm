@@ -253,13 +253,13 @@ _BUDGETS = {Lane.URGENT: (URGENT_BUDGET, URGENT_BUDGET),
 # then the order of submission: an order under way, a message under way past
 # its floor (text, or a KEYS or NACK), a fresh target's KEYS that has waited
 # FRESH_PATIENCE (under way or not, no order queued before that instant still
-# waiting within budget), the orders within budget, a fresh target's KEYS
-# that has waited but behind such an order, text past the floor, another
-# KEYS or NACK under way, a fresh target's, the rest within budget, text, and
-# whatever is past its budget. What goes ahead of text past the floor, but
-# what is under way, is the orders and what the fresh KEYS paid: the orders
-# within their own budget (the allowance for a second human), the KEYS
-# within URGENT_BUDGET + FRESH_ALLOWANCE less what the orders had spent.
+# waiting: under way, or within budget), the orders within budget, a fresh
+# target's KEYS that has waited but behind such an order, text past the floor,
+# another KEYS or NACK under way, a fresh target's, the rest within budget,
+# text, and whatever is past its budget. What goes ahead of text past the
+# floor, but what is under way, is the orders and what the fresh KEYS paid:
+# the orders within their own budget (the allowance for a second human), the
+# KEYS within URGENT_BUDGET + FRESH_ALLOWANCE less what the orders had spent.
 (_STARTED_URGENT, _STARVED_STARTED, _FRESH_FIRST, _URGENT, _FRESH_NEXT, _STARVED_TEXT,
  _STARTED_REACTIVE, _FRESH_REACTIVE, _REACTIVE, _TEXT, _PAST_BUDGET) = range(11)
 
@@ -484,8 +484,8 @@ class Pacer:
         """Where a fresh target's KEYS (the rest of it, of `cost`) goes
         ahead of text past the floor: None before its patience is out, or
         while URGENT's allowance has no room for it. Behind the orders
-        queued before its patience ran out, still waiting within budget;
-        ahead of the others."""
+        queued before its patience ran out still waiting (under way, or
+        within budget); ahead of the others."""
         if not (self._waited(key, now) and self._allowed(Lane.URGENT, cost, now)):
             return None
         return _FRESH_NEXT if self._order_before(key, now) else _FRESH_FIRST
@@ -497,12 +497,14 @@ class Pacer:
 
     def _order_before(self, key: str, now: float) -> bool:
         # A seq is drawn when the patience runs out (due()): the orders
-        # queued before have lower ones, under way or not (one under way
-        # matters only while its target's window holds it: otherwise it goes
-        # first anyway). Not drawn yet, every order is.
+        # queued before have lower ones. Not drawn yet, every order is. One
+        # under way counts whatever its budget, as it goes first whatever
+        # its budget (it matters here only while its target's window holds
+        # it); one not started, within budget.
         cutoff = self._cutoff.get(key, inf)
         return any(lanes[Lane.URGENT][0].seq < cutoff
-                   and self._budget_rank(k, Lane.URGENT, now) == _URGENT
+                   and (self._open.get((k, Lane.URGENT)) is not None
+                        or self._budget_rank(k, Lane.URGENT, now) == _URGENT)
                    for k, lanes in self._queues.items() if lanes[Lane.URGENT])
 
     def _last_reactive(self, key: str) -> float:
