@@ -2370,3 +2370,35 @@ def test_a_fresh_keys_goes_ahead_of_an_order_under_way_queued_after_its_patience
     assert [released[a[0]][0] for a in to_vjt] == [0.0, 0.0, 0.0, 6.0, 6.0, 6.0]
     assert [released[line][0] for line in chal] == [11.0, 20.0]
     assert [released[line][0] for line in keys] == [16.0, 23.0] and not p.take_dropped()
+
+
+def test_a_fresh_keys_leaves_the_reserve_to_an_older_order_that_started_after_its_patience_ran_out():
+    # Review Q, Q2a: what counts is when an order was queued, not when it
+    # started: one queued before the patience ran out holds the KEYS back
+    # once under way, even if its first line left after. The application's
+    # 3.5 s at 0 hold vjt's fresh KEYS until three ACKs to vjt at 3.5 fill
+    # vjt's window until 9.5; its patience runs out at 8. lucy's two ACKs
+    # and pre-key CHAL come at 7.75, just before: the orders' minute is then
+    # 28 s, 28 + 14 > 36 (lucy drew the ACKs: no allowance), and the bank
+    # holds the CHAL's first line until 8.5, past the patience. Under way,
+    # it keeps the KEYS out of lucy's window gap: the CHAL goes at 13.75 and
+    # 17.5, in time (by 20.75), the KEYS at 22.5 and 25.5. Counted only had
+    # it started before the patience ran out, the KEYS took the reserve at
+    # 13.5 and the CHAL's last line left at 22.5, late.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    h0 = [msg("h0", 5, 4) for _ in range(2)]
+    to_vjt, keys = [msg("vjt", 2) for _ in range(3)], msg("vjt", 5, 3, verb="KEYS")
+    to_lucy, chal = [msg("lucy", 2) for _ in range(2)], msg("lucy", 5, 5, 4)
+    ev = [(-40.0 + 10.0 * i, lambda now, o=o: p.submit("h0", o, lane=Lane.URGENT, deadline=now + 15.0))
+          for i, o in enumerate(h0)]
+    ev += [(0.0, lambda now: lag.add(3.5, now)),
+           (0.0, lambda now: p.submit("vjt", keys, lane=Lane.REACTIVE)),
+           (3.5, lambda now: [p.submit("vjt", a, lane=Lane.URGENT) for a in to_vjt]),
+           (7.75, lambda now: [p.submit("lucy", a, lane=Lane.URGENT) for a in to_lucy]),
+           (7.75, lambda now: p.submit("lucy", chal, lane=Lane.URGENT, deadline=now + 15.0))]
+    released = released_by_wakeups(p, -40.0, ev)
+    assert [released[a[0]][0] for a in to_vjt + to_lucy] == [3.5, 3.5, 3.5, 7.75, 7.75]
+    assert [released[line][0] for line in chal] == [8.5, 13.75, 17.5]
+    assert released[chal[-1]][0] <= 7.75 + 15.0 - ACK_MARGIN and not p.take_dropped()
+    assert [released[line][0] for line in keys] == [22.5, 25.5]

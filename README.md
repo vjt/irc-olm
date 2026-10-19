@@ -350,11 +350,13 @@ shape named, not beyond it):
   (`keys-timeout`, reported). This is the known limit: about three first
   contacts a minute. A first contact held behind an order under way waits
   for it, and then loses its turn to first contacts that arrived meanwhile
-  and were never served, since the lines that held its window served it:
-  in 800 000 random shapes built round that case (the hold changes 250 of
-  them) the KEYS completing past 30 s go from 36 to 50 and past 60 s from
-  0 to 3 (at most 81.5 s, each with four first contacts within 18 s), while
-  the challenges late or dropped go from 183 to 38.
+  and were never served, since the lines that held its window served it;
+  those may spend the allowance and the connection's REACTIVE budget, and
+  it then waits behind the text, past its budget. Of 800 000 random shapes
+  built round that case the hold changes 250, and in those 250 the KEYS
+  completing past 30 s go from 36 to 50 and past 60 s from 0 to 3 (at most
+  81.5 s, each with four first contacts within 18 s), while the challenges
+  late or dropped go from 183 to 38; the other shapes are released alike.
 - One pinned nick using both lanes (addressing the bot every 4 to 15 s while
   drawing a NACK every 3 s and a KEYS every 15 s) takes up to 54 s in a
   minute (its two budgets allow 36 + 18), and leaves text 10.8 to 12.
@@ -369,9 +371,9 @@ shape named, not beyond it):
 
 REACTIVE and TEXT lines never take the bank past 5 s (a full line, 6 s, goes
 at an empty bank), except a first contact's KEYS that has waited 8 s, with
-room in the allowance and no order queued before it still waiting (under
-way, or not started within budget), and the rest of a KEYS or NACK whose
-last line left 20 s ago.
+room in the allowance and no order queued before its 8 s ran out still
+waiting (under way, or not started within budget), and the rest of a KEYS
+or NACK whose last line left 20 s ago.
 The rest is kept for URGENT lines, at no cost in throughput (the bank drains
 a second a second either way): behind a stream of text, a challenge on an
 established session (two lines) leaves within 7 s, a first challenge (a
