@@ -234,7 +234,7 @@ at a time (KEYS and NACKs to different targets may interleave).
   for the whole connection, whoever gives the orders: four orders, or a first
   contact and two (with a short own mask too). One human may take it all;
   a second human, and a first contact's KEYS going ahead of the orders
-  (below), share a 9 s allowance on top.
+  (below), take what the orders leave of 45 s.
   Peers draw these too, since the bot challenges every line a pinned human
   addresses to it, and humans chatting with it would otherwise take the whole
   bank. A challenge carries its deadline (the engine hands the pacer the
@@ -249,53 +249,60 @@ at a time (KEYS and NACKs to different targets may interleave).
   text within 18 s of bank per target per minute (five NACKs and a KEYS, the
   recovery after a lost session, or a KEYS and a retry's) and 22 s for all
   targets together. A KEYS or NACK under way whose last line left 20 s ago
-  goes next after text under way past the floor and a first contact's KEYS
-  that has waited (below), ahead of the orders, so its receiver gets the
-  rest within the same 46 s as text.
+  goes next after an order under way, taking turns with text under way past
+  the floor (below), ahead of the other orders and of the first contacts'
+  KEYS, so its receiver gets the rest within the same 46 s as text, plus a
+  line for every other message under way past its floor at that instant.
 - **TEXT**: no budget, and a floor instead: when text is queued and none has
   left for 20 s, a text message under way goes next after an order under
   way, since its receiver would drop it; a message not started yet goes after
-  the orders, the first contacts' KEYS that have waited (below) and the rest
-  of a KEYS or NACK under way past its own 20 s. The orders' budget and the
-  allowance keep the first two to about 45 s of bank a minute, so its first
-  line can wait about 70 s (69 measured), and text keeps 10 s a minute or
-  more (measured below). A message under way therefore
-  gets a line at least every 46 s
-  (the floor, the rest of one order, the bank emptying for the text line and
-  the target's window), inside the 60 s its receiver keeps it, whatever goes
-  ahead of it.
+  the orders, the first contacts' KEYS that have waited (below) and the
+  messages under way past their floor. When the orders spend first, the
+  first two take at most about 45 s of bank a minute, so its first line can
+  wait about 70 s (69 measured); when first contacts pay first, the orders
+  still take their own 36 s on top (below), and it can wait about 95 s (94
+  measured). Text keeps 10 s a minute or more (measured below). A message
+  under way therefore gets a line at least every 46 s (the floor, the rest of
+  one order, the bank emptying for the text line and the target's window),
+  inside the 60 s its receiver keeps it, whatever goes ahead of it, plus a
+  line for each KEYS or NACK under way past its own floor that has the turn
+  first.
 
 A budget counts all of a message's lines, decided when its first one is due,
 so ahead of text the orders never take more than 36 s in any minute (45 with
 the allowance below) and the KEYS and NACKs of one target never more than 18.
 Past its budget an urgent or reactive message waits behind the text, but it
 still goes when no text line can (none queued, or the text target's window
-full), since the bank would idle otherwise: with no text, or short text
-lines, a minute can hold more (measured: 55 s of orders with one text target
-of 2 s lines, 69 with no text, 26 s of one flooder's KEYS and NACKs with no
-text). A target which drew nothing else from a lane in the last minute
-(nothing sent, this one message queued) may still take the connection's
-budget 9 s further, one message for all such targets together: an honest
-peer behind flooders, a second human behind a chatty one. Such a target's
-KEYS or NACK goes ahead of everyone else's not started yet at once. A first
-contact's KEYS goes further: once it has waited 8 s (`FRESH_PATIENCE`), it
-goes ahead of the orders queued after that instant and of text past the
-floor, taking the reserve below if it needs it, and what of it goes ahead
-is paid, once, from the orders' allowance, the one the second human takes.
-A first contact is thus answered before its asker asks again (30 s); the
-orders queued before keep their place, waiting on the bank or not (a
-challenge arriving meanwhile has 15 s to be answered); and the orders keep
-their own 36 s. Ahead of text past the floor, the orders, the second human
-and the first contacts together never take more than 45 s a minute, and
-while the orders are at their budget one of the second human and the first
-contacts goes in a minute. A NACK never goes ahead of the orders: nobody
-waits on it (its sender keeps the message 30 minutes), whereas a KEYS's
-asker asks again at 30 s and drops what it queued at 60. A flooder held
-back by the budget always has more queued. Turns go to
-the target served longest ago, in every lane, so one
-target's messages do not hold another's back. Within a target each lane keeps
-its order, so a short message never overtakes a long one sent before it. A
-target is its case-folded nick.
+full), since the bank would idle otherwise: with no text, or short text lines,
+a minute can hold more (measured: 55 s of orders with one text target of 2 s
+lines, 69 with no text, 26 s of one flooder's KEYS and NACKs with no text). A
+target which drew nothing else from a lane in the last minute (nothing sent,
+this one message queued) may still take the connection's budget 9 s further,
+one message for all such targets together: an honest peer behind flooders, a
+second human behind a chatty one. Such a target's KEYS or NACK goes ahead of
+everyone else's KEYS and NACKs not started yet. A first contact's KEYS goes
+further: once it has waited 8 s (`FRESH_PATIENCE`), it goes ahead of the
+orders queued after that instant and of text past the floor, taking the
+reserve below if it needs it, and what is left of it then is paid, once,
+from the room the second human takes too. A first contact is thus answered
+before its asker asks again (30 s); the orders queued before keep their
+place, waiting on the bank or on their target's window: behind one the KEYS
+leaves it the reserve (a challenge arriving meanwhile has 15 s to be
+answered); and the orders keep their own 36 s whatever was paid. So ahead of
+text past the floor a minute holds at most 45 s of orders, second human and
+first contacts when the orders spend first, but the orders' 36 s on top of
+what was paid when the first contacts pay first (60 s measured: two to four
+first contacts in a burst, one human addressing the bot every 6 to 15 s).
+That is the price of a human's orders never failing because strangers came
+first: holding the orders to the 45 s as well dropped about twice as many of
+that human's challenges. While the orders are at their budget one of the
+second human and the first contacts goes in a minute. A NACK never goes ahead
+of the orders: nobody waits on it (its sender keeps the message 30 minutes),
+whereas a KEYS's asker asks again at 30 s and drops what it queued at 60. A
+flooder held back by the budget always has more queued. Turns go to the target
+served longest ago, in every lane, so one target's messages do not hold
+another's back. Within a target each lane keeps its order, so a short message
+never overtakes a long one sent before it. A target is its case-folded nick.
 
 Measured (`irc-olm` PR 2, no application lines; each figure holds for the
 shape named, not beyond it):
@@ -319,7 +326,7 @@ shape named, not beyond it):
   contact in the same minute, a second human's 6 + 5 s challenge is dropped
   late in 446 of 810 shapes (8 of 30 with no first contact), and a second
   first contact within about 10 s of the first waits up to 38.5 s for its
-  KEYS (past 30 s in 57 of 2500 random shapes).
+  KEYS (past 30 s in 56 of 2500 random shapes).
 - Fresh peers on top, each drawing one NACK every 75 s (up to 24 of them) or
   one KEYS every 61 s (up to 6), with one to four humans chatting: the orders
   keep their budget (34.6 s of bank a minute; one human every 15 s among 16
@@ -345,13 +352,15 @@ shape named, not beyond it):
   minute (its two budgets allow 36 + 18), and leaves text 10.8 to 12.
 - Multi-line messages under flood leave at most 23 s between fragments, and
   39 s in random mixes of orders, flooders and long replies. The second line
-  of a KEYS under way leaves at most 33 s after its first behind chatting
-  humans, 44 s in random mixes. A KEYS after six NACKs in the same minute
-  still waits for the budget to recover, a minute late.
+  of a KEYS under way leaves at most 31 s after its first behind chatting
+  humans, 30 s in random mixes, and 34 s at the worst a search found, with
+  up to seven first contacts round it and the bot talking at a tenth of its
+  bank. A KEYS after six NACKs in the same minute still waits for the budget
+  to recover, a minute late.
 
 REACTIVE and TEXT lines never take the bank past 5 s (a full line, 6 s, goes
-at an empty bank), except a KEYS or NACK going ahead of text past the floor:
-a first contact's KEYS that has waited 8 s, and the rest of a KEYS or NACK
+at an empty bank), except a first contact's KEYS that has waited 8 s with
+no order queued before it still waiting, and the rest of a KEYS or NACK
 whose last line left 20 s ago.
 The rest is kept for URGENT lines, at no cost in throughput (the bank drains
 a second a second either way): behind a stream of text, a challenge on an
