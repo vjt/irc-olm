@@ -225,19 +225,24 @@ that the sender holding the most loses its message furthest from completion
 `Dropped` event.
 
 Lines wait in three lanes (`pacing.Lane`), and are scheduled by message: once
-a message's first line has left, its other lines go before anything not yet
-started, and one message of each lane is under way at a time.
+an urgent or a text message's first line has left, no other message of its
+lane starts before it ends, so one urgent and one text message are under way
+at a time (KEYS and NACKs to different targets may interleave).
 - **URGENT**: what we originate and cannot wait, a KEYREQ and the messages
   carrying a challenge or an ACK (the engine lists their msgids in
   `Result.urgent`). They go ahead of text within 36 s of flood bank a minute
   for the whole connection, whoever gives the orders: four orders, or a first
-  contact and two (with a short own mask too). One human may take it all.
+  contact and two (with a short own mask too). One human may take it all,
+  and the key answers that go ahead of the orders (below) are paid from it.
   Peers draw these too, since the bot challenges every line a pinned human
   addresses to it, and humans chatting with it would otherwise take the whole
   bank. A challenge carries its deadline (the engine hands the pacer the
   seconds it has left), and starts only if its last line can leave 2 s before
   it, the ACK's way back: one that could not be answered any more is dropped
-  unsent (`on_lost` `"late"`).
+  unsent (`on_lost` `"late"`). The estimate counts the bank, not the
+  target's window: a challenge reaching the pacer with under 8 s left just
+  behind two NACKs to the same peer can finish up to 3 s late (70 of 2880
+  such cases, measured), and then expires unanswered (`ChallengeExpired`).
 - **REACTIVE**: what a peer draws from us, KEYS and NACK (a KEYS for each
   KEYREQ, at most one per 15 s; a NACK for each junk line). They go ahead of
   text within 18 s of bank per target per minute (five NACKs and a KEYS, the
@@ -246,70 +251,90 @@ started, and one message of each lane is under way at a time.
 - **TEXT**: no budget, and a floor instead: when text is queued and none has
   left for 20 s, a text message under way goes next after an order under
   way, since its receiver would drop it; a message not started yet goes after
-  the orders. A message under way therefore gets a line at least every 46 s
+  the orders and the key answers that have waited (below), all paid from the
+  orders' budget, which keeps them to about 45 s of bank a minute (text keeps
+  13.7 s a minute or more, measured below). A message under way therefore
+  gets a line at least every 46 s
   (the floor, the rest of one order, the bank emptying for the text line and
   the target's window), inside the 60 s its receiver keeps it, whatever goes
   ahead of it.
 
 A budget counts all of a message's lines, decided when its first one is due,
-so the orders never take more than 36 s in any minute (45 with the allowance
-below) and the KEYS and NACKs of one target never more than 18. Past its
-budget an urgent or reactive message waits behind the text, except that a
-target which drew nothing else from that lane in the last minute (nothing
-sent, this one message queued) may still take the connection's budget 9 s
-further, one message for all such targets together: an honest peer behind
-flooders, a second human behind a chatty one. Such a target's KEYS or NACK
-also goes ahead of the orders not yet started and of everyone else's queued
-KEYS, so that a first contact is answered before its asker asks again (30 s).
-A flooder held back by the budget always has more queued. A KEYS or NACK
-under way goes ahead of the orders not yet started too, so that none cuts it
-in two. Turns go to the target served longest ago, in every lane, so one
+so ahead of text the orders never take more than 36 s in any minute (45 with
+the allowance below) and the KEYS and NACKs of one target never more than 18.
+Past its budget an urgent or reactive message waits behind the text, but it
+still goes when no text line can (none queued, or the text target's window
+full), since the bank would idle otherwise: with no text, or short text
+lines, a minute can hold more (measured: 55 s of orders with one text target
+of 2 s lines, 69 with no text, 26 s of one flooder's KEYS and NACKs with no
+text). A target which drew nothing else from a lane in the last minute
+(nothing sent, this one message queued) may still take the connection's
+budget 9 s further, one message for all such targets together: an honest
+peer behind flooders, a second human behind a chatty one. Such a target's
+KEYS or NACK goes ahead of everyone else's not started yet at once, and once
+it has waited 8 s (`FRESH_PATIENCE`) ahead of the orders not yet started
+too, if the orders' budget has room for it, taking the reserve below if it
+needs it: a first contact is answered before its asker asks again (30 s),
+and a challenge arriving meanwhile, which has 15 s to be answered, still
+goes first. It is paid from the orders' budget, the whole message when its
+first line leaves, so the orders and these answers share one budget ahead of
+text. A flooder held back by the budget always has more queued. Turns go to
+the target served longest ago, in every lane, so one
 target's messages do not hold another's back. Within a target each lane keeps
 its order, so a short message never overtakes a long one sent before it. A
 target is its case-folded nick.
 
 Measured (`irc-olm` PR 2, no application lines; each figure holds for the
 shape named, not beyond it):
-- 1, 2, 3 and 6 to 15 holders of pinned nicks flooding us at the most the
-  engine answers (a NACK every 3 s, a KEYS every 15 s): text keeps 42, 39, 38
-  and 38-40 s of bank a minute (35-46 with other NACK and KEYS rates), a
-  challenge on an established session leaves within 6.8 to 8.8 s (5 + 4 or
-  6 + 5 s of lines) and a first one (three lines) within 11.8 s, an honest
-  peer's KEYS within 10.5 s.
+- 1, 2, 3, 6, 10 and 15 holders of pinned nicks flooding us at the most the
+  engine answers (a NACK every 3 s, a KEYS every 15 s): text keeps 42, 39,
+  38, 40, 39 and 38 s of bank a minute (35-46 with other NACK and KEYS
+  rates), a challenge on an established session leaves within 3.95 s
+  (5 + 4 s of lines) or 5.95 s (6 + 5) and a first one (three lines) within
+  10.95 s, an honest peer's KEYS within 10.5 s.
 - Humans chatting with the bot, however many and however fast, and no
-  flooders: the orders never take more than 45 s in any minute, every
-  challenge sent can still be answered (its last line leaves within 13 s),
-  text keeps 14 to 48 s of bank a minute (24.7 with two text streams and
-  1-4 humans every 6-15 s), and an honest peer's KEYS leaves within 22 s;
-  another human's order leaves within 7 s, or within 13 s when it lands just
-  behind the chatting human's challenge (two challenges at a 10 s bank).
-- Humans and flooders together leave text the floor and little more, 8.5 to
-  11 s of bank a minute: a 10-line reply takes about five minutes, a line
-  every 20 to 31 s, and completes.
+  flooders: with two streams of full text lines the orders never take more
+  than 45 s in any minute, every challenge sent can still be answered (its
+  last line leaves within 13 s), text keeps 14 to 48 s of bank a minute
+  (24.7 with two text streams and 1-4 humans every 6-15 s), and an honest
+  peer's KEYS leaves within 27 s (over 22 s in 28 of 144 random shapes, never
+  past the asker's 30 s); another human's order leaves within 7 s, or within
+  13 s when it lands just behind the chatting human's challenge (two
+  challenges at a 10 s bank).
+- Fresh peers on top, each drawing one NACK every 75 s (up to 24 of them) or
+  one KEYS every 61 s (up to 6), with one to four humans chatting: text keeps
+  13.7 to 30 s of bank a minute and is never silent for more than 50 s, and a
+  10-line reply always completes. One to three first contacts' KEYS queued
+  just before a challenge cost it nothing past the bounds below: every
+  challenge with 15 s left is sent.
+- Humans and flooders together leave text the floor and little more, 8 to
+  12.5 s of bank a minute: a 10-line reply takes about five minutes, a line
+  every 22 to 31 s, and completes.
 - Peers drawing one KEYS each just over a minute apart (each "fresh" every
-  time) leave text 34-38 s. Eight of them draw 64 s of bank a minute against
+  time) leave text 34-36 s. Eight of them draw 64 s of bank a minute against
   the 31 s the REACTIVE budget and the allowance let ahead of text, so their
-  KEYS queue: an honest peer's KEYS among them waits up to 25 s, 31 s when
-  humans chat with the bot as well, 88 s when ten humans each address it
-  every 75 s; its asker asks again and may see its queued messages fail
+  KEYS queue: an honest peer's KEYS among them waits up to 32 s, 42 s when
+  two humans chat with the bot as well, 48 to 52 s when four to ten humans
+  address it; its asker asks again and may see its queued messages fail
   (`keys-timeout`, reported). This is the known limit: about three first
   contacts a minute.
-- One pinned nick using both lanes (addressing the bot every 6 or 15 s while
-  drawing a NACK every 3 s and a KEYS every 15 s) takes up to 51 s in a
-  minute (its two budgets allow 36 + 18), and leaves text 11 to 14.
+- One pinned nick using both lanes (addressing the bot every 4 to 15 s while
+  drawing a NACK every 3 s and a KEYS every 15 s) takes up to 54 s in a
+  minute (its two budgets allow 36 + 18), and leaves text 9.6 to 13.2.
 - Multi-line messages under flood leave at most 23 s between fragments, and
   39 s in random mixes of orders, flooders and long replies. A KEYS after six
   NACKs in the same minute still waits for the budget to recover, a minute
   late.
 
 REACTIVE and TEXT lines never take the bank past 5 s (a full line, 6 s, goes
-at an empty bank). The rest is kept for URGENT lines, at no cost in throughput
-(the bank drains a second a second either way): behind a stream of text, a
-challenge on an established session (two lines) leaves within 7 s, a first
-challenge (a pre-key message, three lines) within 12 s, whatever flooders do.
-Both bounds assume no other urgent message queued ahead, no text message
-under way that has waited 20 s (the floor), no KEYS or NACK under way (a
-fresh peer's, or one a flooder started: 3 s for a KEYS) and no line of the
+at an empty bank), except a fresh peer's KEYS or NACK that has waited 8 s.
+The rest is kept for URGENT lines, at no cost in throughput (the bank drains
+a second a second either way): behind a stream of text, a challenge on an
+established session (two lines) leaves within 7 s, a first challenge (a
+pre-key message, three lines) within 12 s, whatever flooders do (measured
+4.9 to 6.9 s and 9.9 to 11.9 s). Both bounds assume no other urgent message
+queued ahead, no text message under way that has waited 20 s (the floor), no
+fresh peer's KEYS or NACK that has waited 8 s, and no line of the
 application's own in the last 10 s, each of which adds its cost; and the 15 s
 of a challenge (14 to 15: it expires at a whole second) run from
 `challenge()`, so on first contact they also cover the KEYREQ and the KEYS
@@ -335,7 +360,9 @@ fragmented message is worse than none):
   `submit_all` says so;
 - at most 32 lines per target in each of the URGENT and REACTIVE lanes.
 
-`Pacer.submit` takes whole messages only (ValueError otherwise). A `send`
+`Pacer.submit` takes whole messages, one after another: ValueError when one
+cuts into another or the last line does not end one (fragment indexes are
+not checked; `submit_all` passes the messages the engine built). A `send`
 that raises is logged, the rest of its message dropped and reported, and the
 thread carries on.
 
