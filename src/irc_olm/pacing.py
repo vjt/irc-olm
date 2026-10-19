@@ -121,15 +121,15 @@ FRESH_ALLOWANCE = 9.0
 BUDGET_WINDOW = 60.0
 # A fresh target's KEYS waits behind the orders not yet started, and behind
 # text past the floor, for this long. Then it goes ahead of the orders queued
-# after that instant (those queued before keep their place, waiting on the
-# bank or on their target's window: a CHAL arriving meanwhile, 15 s to be
-# answered, still goes first, and the KEYS behind it leaves it the reserve)
-# and of text past the floor, takes the reserve ahead of them all, and pays
-# for the rest of it, once, from URGENT's allowance: one first contact a
-# minute while the orders are at their budget. Its asker asks again at
-# KEYREQ_RETRY (30 s) and drops what it queued at OUTQ_TTL (60 s). A NACK has
-# no asker waiting (its sender keeps the message SENT_MEMORY) and never goes
-# ahead of the orders.
+# after that instant (those queued before keep their place, started or not,
+# waiting on the bank or on their target's window: a CHAL arriving meanwhile,
+# 15 s to be answered, still goes first, and the KEYS behind it leaves it the
+# reserve) and of text past the floor, takes the reserve ahead of them all,
+# and pays for the rest of it, once, from URGENT's allowance: one first
+# contact a minute while the orders are at their budget. Its asker asks again
+# at KEYREQ_RETRY (30 s) and drops what it queued at OUTQ_TTL (60 s). A NACK
+# has no asker waiting (its sender keeps the message SENT_MEMORY) and never
+# goes ahead of the orders.
 FRESH_PATIENCE = 8.0
 # Text queued and no text line released for this long: a text message under
 # way goes next after an order under way, one not started after the orders
@@ -138,7 +138,8 @@ FRESH_PATIENCE = 8.0
 # text line (10 s) and the target's window (6 s): 46 s, inside the 60 s its
 # receiver keeps it. The rest of a KEYS or NACK whose last line left this
 # long ago takes turns with it, taking the reserve: the same 46 s, plus a
-# line for every other message under way past its floor at that instant.
+# line for each other message under way past its own floor that has the
+# turn first.
 TEXT_FLOOR = 20.0
 # A CHAL starts only if its last line can leave this long before its
 # deadline at the bank as it stands: the ACK's way back (the peer's decrypt,
@@ -496,10 +497,11 @@ class Pacer:
 
     def _order_before(self, key: str, now: float) -> bool:
         # A seq is drawn when the patience runs out (due()): the orders
-        # queued before have lower ones. Not drawn yet, every order is.
+        # queued before have lower ones, under way or not (one under way
+        # matters only while its target's window holds it: otherwise it goes
+        # first anyway). Not drawn yet, every order is.
         cutoff = self._cutoff.get(key, inf)
         return any(lanes[Lane.URGENT][0].seq < cutoff
-                   and self._open.get((k, Lane.URGENT)) is None
                    and self._budget_rank(k, Lane.URGENT, now) == _URGENT
                    for k, lanes in self._queues.items() if lanes[Lane.URGENT])
 
