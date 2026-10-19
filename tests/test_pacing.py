@@ -2185,3 +2185,126 @@ def test_first_contacts_that_paid_before_the_orders_leave_them_their_own_budget(
     assert seen == [32]
     assert [released[o[0]][0] for o in orders] == [39.0, 48.0, 57.0, 66.0]
     assert not p.take_dropped()
+
+
+# --- review N: the order under way, the gap an older order leaves, turns --
+
+def test_the_rest_of_a_fresh_keys_leaves_the_reserve_to_an_older_order_under_way_held_by_its_window():
+    # Review N, N1a: M1c left the reserve to the older orders not started
+    # only. lucy's two ACKs at 5.5 s and the first line of lucy's CHAL at 8
+    # fill lucy's window until 11.5; the rest of vjt's fresh KEYS, its
+    # patience out at 8, took the reserve at 11 behind that order under way,
+    # and the CHAL's last line left at 20, past 18.5 (its deadline less
+    # ACK_MARGIN): the challenge expired. It leaves the reserve to the order
+    # now: the CHAL goes at 13 and 17, the rest at its floor, 20.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    keys, chal = msg("vjt", 5, 3, verb="KEYS"), msg("lucy", 5, 5, 4)
+    acks = [msg("lucy", 2) for _ in range(2)]
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(0.0) == [("vjt", keys[0])]
+    lag.add(4, 0.0)                              # the application's own lines
+    ev = [(5.5, lambda now: [p.submit("lucy", a, lane=Lane.URGENT) for a in acks]),
+          (5.5, lambda now: p.submit("lucy", chal, lane=Lane.URGENT, deadline=now + 15.0))]
+    released = released_by_wakeups(p, 0.0, ev)
+    assert [released[a[0]][0] for a in acks] == [5.5, 5.5]
+    assert [released[line][0] for line in chal + keys[1:]] == [8.0, 13.0, 17.0, TEXT_FLOOR]
+    assert released[chal[-1]][0] <= 5.5 + 15.0 - ACK_MARGIN and not p.take_dropped()
+
+
+def fresh_rest_in_an_older_orders_gap(p, lag):
+    """Review N's N4a shape: s0's text, queued at -14 s, passes its floor at
+    6 unstarted (its 6 s line needs an empty bank); vjt's fresh KEYS starts
+    at 0 and the application's lines hold its rest past its patience (8 s);
+    lucy's three ACKs at 7.5 fill lucy's window until 13.5, and lucy's CHAL,
+    queued then, waits on it. Returns (keys, chal, events), to drive from
+    -14 s."""
+    keys, chal = msg("vjt", 5, 3, verb="KEYS"), msg("lucy", 5, 4)
+    acks = [msg("lucy", 2) for _ in range(3)]
+    lag.add(14, -14.0)                           # the application's own lines
+    assert p.submit("s0", [L6] * 6, lane=Lane.TEXT)
+    assert p.due(-14.0) == []                    # the floor's clock starts
+    ev = [(0.0, lambda now: p.submit("vjt", keys, lane=Lane.REACTIVE)),
+          (0.5, lambda now: lag.add(3.5, now)),  # the application's
+          (7.5, lambda now: [p.submit("lucy", a, lane=Lane.URGENT) for a in acks]),
+          (7.5, lambda now: p.submit("lucy", chal, lane=Lane.URGENT, deadline=now + 15.0))]
+    return keys, chal, ev
+
+
+def test_the_rest_of_a_fresh_keys_goes_in_an_older_orders_gap_ahead_of_text_not_started_and_pays():
+    # Review N, N4a: behind an order held by its target's window the rest
+    # goes in the window's gap, under the reserve's limit (a bank of 2 at
+    # 12.5 s), ahead of text past the floor not started, and pays for it;
+    # the order goes when lucy's window opens, at 13.5 and 16.5.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    keys, chal, ev = fresh_rest_in_an_older_orders_gap(p, lag)
+    released = released_by_wakeups(p, -14.0, ev)
+    assert [released[line][0] for line in keys + chal] == [0.0, 12.5, 13.5, 16.5]
+    assert paid(p) == 3
+
+
+def test_what_a_fresh_keys_paid_in_an_older_orders_gap_counts_against_the_next_first_contact():
+    # Review N, N4a: the 3 s that rest paid count in the allowance. h0's two
+    # orders at 17 and 25 s bring the orders' minute to 35 s with lucy's
+    # (from 7.5): pz's KEYS, a first contact at 30, finds 35 + 3 + 8 past
+    # 45 when its patience runs out, so it stays behind text past the floor
+    # and goes once the text's line at 46.5 has reset the floor, at an empty
+    # bank, 52.5. Unpaid, it went ahead at 41.5.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    keys, chal, ev = fresh_rest_in_an_older_orders_gap(p, lag)
+    orders, pz = [msg("h0", 6, 5), msg("h0", 5, 4)], msg("pz", 5, 3, verb="KEYS")
+    ev += [(17.0 + 8.0 * i, lambda now, o=o: p.submit("h0", o, lane=Lane.URGENT, deadline=now + 15.0))
+           for i, o in enumerate(orders)]
+    ev += [(30.0, lambda now: p.submit("pz", pz, lane=Lane.REACTIVE))]
+    released = released_by_wakeups(p, -14.0, ev)
+    assert [released[o[0]][0] for o in orders] == [22.5, 32.5] and not p.take_dropped()
+    assert released[pz[0]][0] == 52.5 and paid(p) == 3
+
+
+def test_past_both_floors_the_rest_of_a_keys_goes_before_text_whose_target_was_served_since():
+    # Review N, N5a: a KEYS or NACK under way past its floor takes turns
+    # with text under way past the floor, the target served longest ago
+    # first. lucy's text started at -15 s (its floor at 5), vjt's recovery
+    # KEYS at 0 (its floor at 20), an ACK to lucy at 1; the application
+    # keeps the bank up until 21. At 20 vjt, served longer ago, goes first,
+    # taking the reserve; lucy's 6 s lines need an empty bank, 30 and 36.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    text, keys = msg("lucy", 6, 6, 6), msg("vjt", 5, 3, verb="KEYS")
+    nack, ack = msg("vjt", 2, verb="NACK"), msg("lucy", 2)
+    assert p.submit("lucy", text, lane=Lane.TEXT)
+    assert p.due(-15.0) == [("lucy", text[0])]
+    assert p.submit("vjt", nack, lane=Lane.REACTIVE)
+    assert p.due(-6.0) == [("vjt", nack[0])]     # the recovery: not fresh
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(0.0) == [("vjt", keys[0])]
+    assert p.submit("lucy", ack, lane=Lane.URGENT)
+    assert p.due(1.0) == [("lucy", ack[0])]
+    ev = [(1.0 + i, lambda now: lag.add(1, now)) for i in range(20)]   # the application's
+    released = released_by_wakeups(p, 1.0, ev)
+    assert [released[line][0] for line in keys[1:] + text[1:]] == [TEXT_FLOOR, 30.0, 36.0]
+
+
+def test_past_both_floors_text_goes_before_the_rest_of_a_keys_whose_target_was_served_since():
+    # Review N, N5a, the other way round: lucy's text started at 0 (its
+    # floor at 20), vjt's recovery KEYS at 10 (its floor at 30); the
+    # application keeps the bank up until 31. At 30 lucy, served longer ago,
+    # has the turn: its 6 s line waits for an empty bank, at 35, and vjt's
+    # rest goes right behind it.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    text, keys = msg("lucy", 6, 6, 6), msg("vjt", 5, 3, verb="KEYS")
+    nack = msg("vjt", 2, verb="NACK")
+    assert p.submit("vjt", nack, lane=Lane.REACTIVE)
+    assert p.due(-10.0) == [("vjt", nack[0])]    # the recovery: not fresh
+    assert p.submit("lucy", text, lane=Lane.TEXT)
+    assert p.due(0.0) == [("lucy", text[0])]
+    lag.add(4, 0.0)                              # the application's own lines
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(10.0) == [("vjt", keys[0])]
+    ev = [(11.0 + i, lambda now: lag.add(1, now)) for i in range(20)]  # the application's
+    released = released_by_wakeups(p, 10.0, ev)
+    assert [released[line][0] for line in text[1:] + keys[1:]] == [35.0, 44.0, 35.0]
+    assert released[text[1]][1] < released[keys[-1]][1]
