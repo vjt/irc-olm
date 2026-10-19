@@ -2215,10 +2215,11 @@ def test_the_rest_of_a_fresh_keys_leaves_the_reserve_to_an_older_order_under_way
 def fresh_rest_in_an_older_orders_gap(p, lag):
     """Review N's N4a shape: s0's text, queued at -14 s, passes its floor at
     6 unstarted (its 6 s line needs an empty bank); vjt's fresh KEYS starts
-    at 0 and the application's lines hold its rest past its patience (8 s);
-    lucy's three ACKs at 7.5 fill lucy's window until 13.5, and lucy's CHAL,
-    queued then, waits on it. Returns (keys, chal, events), to drive from
-    -14 s."""
+    at 0, the application's lines hold its rest until 6, s0's text past the
+    floor (ranked ahead of it, waiting for an empty bank: nothing else goes)
+    until 7.5, and lucy's three ACKs then, past its patience (8 s). They
+    fill lucy's window until 13.5, and lucy's CHAL, queued with them, waits
+    on it. Returns (keys, chal, events), to drive from -14 s."""
     keys, chal = msg("vjt", 5, 3, verb="KEYS"), msg("lucy", 5, 4)
     acks = [msg("lucy", 2) for _ in range(3)]
     lag.add(14, -14.0)                           # the application's own lines
@@ -2248,19 +2249,21 @@ def test_what_a_fresh_keys_paid_in_an_older_orders_gap_counts_against_the_next_f
     # Review N, N4a: the 3 s that rest paid count in the allowance. h0's two
     # orders at 17 and 25 s bring the orders' minute to 35 s with lucy's
     # (from 7.5): pz's KEYS, a first contact at 30, finds 35 + 3 + 8 past
-    # 45 when its patience runs out, so it stays behind text past the floor
-    # and goes once the text's line at 46.5 has reset the floor, at an empty
-    # bank, 52.5. Unpaid, it went ahead at 41.5.
+    # 45 when its patience runs out (38 s, vjt's 3 s still in the window),
+    # so it stays behind text past the floor and goes once the text's line
+    # at 46.5 has reset the floor, at an empty bank, 52.5. Unpaid, it went
+    # ahead at 41.5.
     lag = FakeLag()
     p = Pacer(fakelag=lag)
     keys, chal, ev = fresh_rest_in_an_older_orders_gap(p, lag)
-    orders, pz = [msg("h0", 6, 5), msg("h0", 5, 4)], msg("pz", 5, 3, verb="KEYS")
+    orders, pz, seen = [msg("h0", 6, 5), msg("h0", 5, 4)], msg("pz", 5, 3, verb="KEYS"), []
     ev += [(17.0 + 8.0 * i, lambda now, o=o: p.submit("h0", o, lane=Lane.URGENT, deadline=now + 15.0))
            for i, o in enumerate(orders)]
-    ev += [(30.0, lambda now: p.submit("pz", pz, lane=Lane.REACTIVE))]
+    ev += [(30.0, lambda now: p.submit("pz", pz, lane=Lane.REACTIVE)),
+           (30.0 + FRESH_PATIENCE, lambda now: seen.append(paid(p)))]
     released = released_by_wakeups(p, -14.0, ev)
     assert [released[o[0]][0] for o in orders] == [22.5, 32.5] and not p.take_dropped()
-    assert released[pz[0]][0] == 52.5 and paid(p) == 3
+    assert seen == [3] and released[pz[0]][0] == 52.5
 
 
 def test_past_both_floors_the_rest_of_a_keys_goes_before_text_whose_target_was_served_since():
@@ -2308,3 +2311,34 @@ def test_past_both_floors_text_goes_before_the_rest_of_a_keys_whose_target_was_s
     released = released_by_wakeups(p, 10.0, ev)
     assert [released[line][0] for line in text[1:] + keys[1:]] == [35.0, 44.0, 35.0]
     assert released[text[1]][1] < released[keys[-1]][1]
+
+
+# --- review O: an order under way counts whatever its budget -------------
+
+def test_a_fresh_keys_leaves_the_reserve_to_an_older_order_under_way_past_its_budget():
+    # Review O: an order under way goes first whatever its budget
+    # (_STARTED_URGENT), so it holds a fresh KEYS back whatever its budget
+    # too. h0's two orders leave the orders' minute at 18 s; three ACKs to
+    # vjt at 0 fill vjt's window until 6, so vjt's KEYS, a first contact
+    # asked at 0, cannot start; lucy's two ACKs and pre-key CHAL at 4.5
+    # take the orders past their budget (lucy drew the ACKs: no allowance),
+    # and with nothing else able to go the CHAL starts on the idle bank at
+    # 5, its second line held by lucy's window until 10.5. Counted only
+    # within budget, the CHAL under way let the KEYS, its patience out at
+    # 8, take the reserve at 10, and the CHAL's last line left at 19, past
+    # 17.5 (its deadline less ACK_MARGIN). Now it leaves at 14, and the
+    # KEYS at 20 and 22.
+    p = Pacer(fakelag=FakeLag())
+    h0 = [msg("h0", 5, 4) for _ in range(2)]
+    to_vjt, keys = [msg("vjt", 2) for _ in range(3)], msg("vjt", 5, 3, verb="KEYS")
+    to_lucy, chal = [msg("lucy", 2) for _ in range(2)], msg("lucy", 5, 5, 4)
+    ev = [(-40.0 + 10.0 * i, lambda now, o=o: p.submit("h0", o, lane=Lane.URGENT, deadline=now + 15.0))
+          for i, o in enumerate(h0)]
+    ev += [(0.0, lambda now: [p.submit("vjt", a, lane=Lane.URGENT) for a in to_vjt]),
+           (0.0, lambda now: p.submit("vjt", keys, lane=Lane.REACTIVE)),
+           (4.5, lambda now: [p.submit("lucy", a, lane=Lane.URGENT) for a in to_lucy]),
+           (4.5, lambda now: p.submit("lucy", chal, lane=Lane.URGENT, deadline=now + 15.0))]
+    released = released_by_wakeups(p, -40.0, ev)
+    assert [released[line][0] for line in chal] == [5.0, 10.5, 14.0]
+    assert released[chal[-1]][0] <= 4.5 + 15.0 - ACK_MARGIN and not p.take_dropped()
+    assert [released[line][0] for line in keys] == [20.0, 22.0]
