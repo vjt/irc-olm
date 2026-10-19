@@ -33,21 +33,21 @@ flooder, a second human behind a chatty one. Such a target's KEYS or NACK
 goes ahead of the others' backlog. A first contact's KEYS that has waited
 FRESH_PATIENCE also goes ahead of the orders queued since, paid from the
 orders' allowance, which it shares with that second human: it is answered
-before its asker asks again, a CHAL queued meanwhile still goes first, and
-the orders keep their own budget. A CHAL carries its deadline, and starts
-only if it can still be answered. TEXT has no budget, and a floor instead:
-text queued and no text line for TEXT_FLOOR seconds, a text message under
-way goes next after an order under way, so it reaches its receiver (who
-drops a partial message 60 s after its last fragment); one not started goes
-after the orders and the first contacts' KEYS. A KEYS or NACK under way
-has that floor too, from its own last line, and takes turns with text under
-way past it. Turns go to the target served longest ago, in every lane;
-within a target each lane keeps its order, so a short message never
-overtakes a long one sent before it, which its reader would see reversed.
-REACTIVE and TEXT lines never take the bank past a reserve kept for URGENT
-ones, so a CHAL behind a stream of text leaves within seconds, but the rest
-of a KEYS or NACK past its floor, and a first contact's KEYS going ahead of
-every order, take it, as the orders do.
+before its asker asks again, a CHAL within budget queued meanwhile still
+goes first, and the orders keep their own budget. A CHAL carries its
+deadline, and starts only if it can still be answered. TEXT has no budget,
+and a floor instead: text queued and no text line for TEXT_FLOOR seconds, a
+text message under way goes next after an order under way, so it reaches
+its receiver (who drops a partial message 60 s after its last fragment);
+one not started goes after the orders and the first contacts' KEYS. A KEYS
+or NACK under way has that floor too, from its own last line, and takes
+turns with text under way past it. Turns go to the target served longest
+ago, in every lane; within a target each lane keeps its order, so a short
+message never overtakes a long one sent before it, which its reader would
+see reversed. REACTIVE and TEXT lines never take the bank past a reserve
+kept for URGENT ones, so a CHAL behind a stream of text leaves within
+seconds, but the rest of a KEYS or NACK past its floor, and a first
+contact's KEYS going ahead of every order, take it, as the orders do.
 """
 
 from __future__ import annotations
@@ -122,14 +122,14 @@ BUDGET_WINDOW = 60.0
 # A fresh target's KEYS waits behind the orders not yet started, and behind
 # text past the floor, for this long. Then it goes ahead of the orders queued
 # after that instant (those queued before keep their place, started or not,
-# waiting on the bank or on their target's window: a CHAL arriving meanwhile,
-# 15 s to be answered, still goes first, and the KEYS behind it leaves it the
-# reserve) and of text past the floor, takes the reserve ahead of them all,
-# and pays for the rest of it, once, from URGENT's allowance: one first
-# contact a minute while the orders are at their budget. Its asker asks again
-# at KEYREQ_RETRY (30 s) and drops what it queued at OUTQ_TTL (60 s). A NACK
-# has no asker waiting (its sender keeps the message SENT_MEMORY) and never
-# goes ahead of the orders.
+# waiting on the bank or on their target's window: a CHAL within budget
+# arriving meanwhile, 15 s to be answered, still goes first, and the KEYS
+# behind it leaves it the reserve) and of text past the floor, takes the
+# reserve ahead of them all, and pays for the rest of it, once, from URGENT's
+# allowance: one first contact a minute while the orders are at their budget.
+# Its asker asks again at KEYREQ_RETRY (30 s) and drops what it queued at
+# OUTQ_TTL (60 s). A NACK has no asker waiting (its sender keeps the message
+# SENT_MEMORY) and never goes ahead of the orders.
 FRESH_PATIENCE = 8.0
 # Text queued and no text line released for this long: a text message under
 # way goes next after an order under way, one not started after the orders

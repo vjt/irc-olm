@@ -2318,10 +2318,11 @@ def test_past_both_floors_text_goes_before_the_rest_of_a_keys_whose_target_was_s
 def test_a_fresh_keys_leaves_the_reserve_to_an_older_order_under_way_past_its_budget():
     # Review O: an order under way goes first whatever its budget
     # (_STARTED_URGENT), so it holds a fresh KEYS back whatever its budget
-    # too. h0's two orders leave the orders' minute at 18 s; three ACKs to
-    # vjt at 0 fill vjt's window until 6, so vjt's KEYS, a first contact
-    # asked at 0, cannot start; lucy's two ACKs and pre-key CHAL at 4.5
-    # take the orders past their budget (lucy drew the ACKs: no allowance),
+    # too. h0's two orders and three ACKs to vjt at 0 leave the orders'
+    # minute at 24 s; the ACKs fill vjt's window until 6, so when lucy's
+    # CHAL comes vjt's KEYS, a first contact asked at 0, cannot start;
+    # lucy's two ACKs and pre-key CHAL at 4.5 take the orders past their
+    # budget, 24 + 4 + 14 > 36 (lucy drew the ACKs: no allowance),
     # and with nothing else able to go the CHAL starts on the idle bank at
     # 5, its second line held by lucy's window until 10.5. Counted only
     # within budget, the CHAL under way let the KEYS, its patience out at
@@ -2342,3 +2343,30 @@ def test_a_fresh_keys_leaves_the_reserve_to_an_older_order_under_way_past_its_bu
     assert [released[line][0] for line in chal] == [5.0, 10.5, 14.0]
     assert released[chal[-1]][0] <= 4.5 + 15.0 - ACK_MARGIN and not p.take_dropped()
     assert [released[line][0] for line in keys] == [20.0, 22.0]
+
+
+def test_a_fresh_keys_goes_ahead_of_an_order_under_way_queued_after_its_patience_ran_out():
+    # Review P, P2a: only the orders queued before the patience ran out
+    # hold a fresh KEYS back, under way or not. Six ACKs to vjt, three at 0
+    # and three at 6, keep vjt's window full until 12, so vjt's KEYS, a
+    # first contact asked at 0, cannot start before; its patience runs out
+    # at 8. lucy's two ACKs and CHAL at 10.5 come after: the CHAL's first
+    # line goes at 11 and lucy's window holds its second until 16.5, where
+    # the KEYS's first line goes at 16, taking the reserve, as a first
+    # contact past its patience does ahead of the orders queued since; the
+    # CHAL's last line leaves at 20, still in time (by 23.5). Counted, the
+    # CHAL went at 16.5 and the KEYS at 20.
+    p = Pacer(fakelag=FakeLag())
+    h0 = msg("h0", 5, 4)
+    to_vjt, keys = [msg("vjt", 2) for _ in range(6)], msg("vjt", 5, 3, verb="KEYS")
+    to_lucy, chal = [msg("lucy", 2) for _ in range(2)], msg("lucy", 5, 4)
+    ev = [(-40.0, lambda now: p.submit("h0", h0, lane=Lane.URGENT, deadline=now + 15.0)),
+          (0.0, lambda now: [p.submit("vjt", a, lane=Lane.URGENT) for a in to_vjt[:3]]),
+          (0.0, lambda now: p.submit("vjt", keys, lane=Lane.REACTIVE)),
+          (6.0, lambda now: [p.submit("vjt", a, lane=Lane.URGENT) for a in to_vjt[3:]]),
+          (10.5, lambda now: [p.submit("lucy", a, lane=Lane.URGENT) for a in to_lucy]),
+          (10.5, lambda now: p.submit("lucy", chal, lane=Lane.URGENT, deadline=now + 15.0))]
+    released = released_by_wakeups(p, -40.0, ev)
+    assert [released[a[0]][0] for a in to_vjt] == [0.0, 0.0, 0.0, 6.0, 6.0, 6.0]
+    assert [released[line][0] for line in chal] == [11.0, 20.0]
+    assert [released[line][0] for line in keys] == [16.0, 23.0] and not p.take_dropped()
