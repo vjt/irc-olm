@@ -19,24 +19,28 @@ long as the application charges what it writes itself; a long message then
 takes minutes (vjt's ruling on grappa-irc 2430, option A).
 
 Three lanes (Lane), scheduled by MESSAGE: once a message's first line has
-left, its other lines go before anything else of its rank, and one text
-message is under way at a time. URGENT is what we originate and cannot wait:
-a KEYREQ, and the messages carrying a CHAL or an ACK (Result.urgent).
+left, its other lines go before anything not yet started, and one message of
+each lane is under way at a time. URGENT is what we originate and cannot
+wait: a KEYREQ, and the messages carrying a CHAL or an ACK (Result.urgent).
 REACTIVE is what a peer draws from us, KEYS and NACK. Both go ahead of text
-within budgets, per target and for the connection, because peers draw both:
-the bot challenges every line a pinned human addresses to it. Past its
-budget a message waits behind the text, except that a target which drew
-nothing from that lane in the last minute may still go ahead, from a small
-allowance: an honest peer, or a second human, behind a flooder or a chatty
-one. A CHAL carries its deadline, and starts only if it can still be
-answered. TEXT has no budget, and a floor instead: text queued and no text
-line for TEXT_FLOOR seconds, the text goes next, so a message under way
+within budgets, per target and for the connection, counted on all of a
+message's lines, because peers draw both: the bot challenges every line a
+pinned human addresses to it. Past its budget a message waits behind the
+text, except that a target which drew nothing from that lane in the last
+minute may still go, from a small allowance: an honest peer behind a
+flooder, a second human behind a chatty one. Such a target's KEYS or NACK
+also goes ahead of the orders not yet started and of the others' backlog,
+so that a first contact is answered before its asker asks again. A CHAL
+carries its deadline, and starts only if it can still be answered. TEXT has
+no budget, and a floor instead: text queued and no text line for TEXT_FLOOR
+seconds, a text message under way goes next after an order under way, so it
 reaches its receiver (who drops a partial message 60 s after its last
-fragment) whatever goes ahead of it. Turns go to the target served longest
-ago, in every lane; within a target each lane keeps its order, so a short
-message never overtakes a long one sent before it, which its reader would
-see reversed. REACTIVE and TEXT lines never take the bank past a reserve kept
-for URGENT ones, so a CHAL behind a stream of text leaves within seconds.
+fragment); one not started goes after the orders. Turns go to the target
+served longest ago, in every lane; within a target each lane keeps its
+order, so a short message never overtakes a long one sent before it, which
+its reader would see reversed. REACTIVE and TEXT lines never take the bank
+past a reserve kept for URGENT ones, so a CHAL behind a stream of text
+leaves within seconds.
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ import threading
 import time
 from collections import deque
 from enum import IntEnum
-from itertools import count
+from itertools import count, islice
 from typing import Callable, Mapping, NamedTuple
 
 from . import framing
@@ -77,27 +81,31 @@ FAKE_LAG_CEILING = 10.0
 # CHAL behind streaming text leaves within 7 s instead of 11.
 RESERVE = 5.0
 # Bank seconds that may go ahead of text in BUDGET_WINDOW, decided when a
-# message's first line is due (it must fit): a message that starts finishes.
+# message's first line is due, on all its lines: a message that starts
+# finishes, and no window holds more than the budget (and the allowance).
 # URGENT, the connection's, whoever gives the orders: four orders (CHALs of
 # 5 + 4 s), or a first contact (KEYREQ, pre-key CHAL) and two; one human may
 # take it all. REACTIVE, per target: five NACKs and a KEYS (the recovery
 # after a lost session), or two KEYS (an answer and a retry's); and for the
 # connection, two KEYS and a few NACKs.
 URGENT_BUDGET = 36.0
-REACTIVE_BUDGET = 16.0
+REACTIVE_BUDGET = 18.0
 REACTIVE_BUDGET_TOTAL = 22.0
 # A target that drew nothing else from a lane in the window (nothing spent,
 # one message queued) may take the connection past its budget by this much,
 # one message more for all such targets together: an honest peer behind
-# flooders, a second human behind a chatty one. A flooder held back by the
-# budget always has more queued.
+# flooders, a second human behind a chatty one. Its KEYS or NACK goes ahead
+# of the orders not yet started too. A flooder held back by the budget
+# always has more queued.
 FRESH_ALLOWANCE = 9.0
 BUDGET_WINDOW = 60.0
-# Text queued and no text line released for this long: the text goes next,
-# ahead of every message not yet started. A message under way then gets a
-# line every TEXT_FLOOR, plus the bank's and the window's wait (10 + 6 s),
-# well inside the 60 s its receiver keeps it.
-TEXT_FLOOR = 30.0
+# Text queued and no text line released for this long: a text message under
+# way goes next after an order under way, one not started after the orders
+# and the fresh answers. A message under way then gets a line every
+# TEXT_FLOOR, plus the rest of one order (10 s), the bank emptying for the
+# text line (10 s) and the target's window (6 s): 46 s, inside the 60 s its
+# receiver keeps it.
+TEXT_FLOOR = 20.0
 # A CHAL starts only if its last line can leave this long before its
 # deadline at the bank as it stands: the ACK's way back (the peer's decrypt,
 # its pacer, two hops). The deadline is when the ACK must be here.
@@ -206,9 +214,12 @@ _BUDGETS = {Lane.URGENT: (URGENT_BUDGET, URGENT_BUDGET),
             Lane.REACTIVE: (REACTIVE_BUDGET, REACTIVE_BUDGET_TOTAL)}
 
 # Ranks, the lowest goes first; then turns (the target served longest ago),
-# then the order of submission.
-(_STARTED_URGENT, _STARVED_STARTED_TEXT, _URGENT, _STARTED_REACTIVE, _STARVED_TEXT,
- _REACTIVE, _TEXT, _PAST_BUDGET) = range(8)
+# then the order of submission. Messages under way first: an order, text
+# past the floor, a KEYS or NACK. Then a fresh target's KEYS or NACK, the
+# orders within budget, text past the floor, the rest within budget, text,
+# and whatever is past its budget.
+(_STARTED_URGENT, _STARVED_STARTED_TEXT, _STARTED_REACTIVE, _FRESH_REACTIVE, _URGENT,
+ _STARVED_TEXT, _REACTIVE, _TEXT, _PAST_BUDGET) = range(9)
 
 
 class Pacer:
@@ -260,7 +271,12 @@ class Pacer:
         queued = self._queues.get(key)
         entries = [self._entry(target, line, deadline if lane is Lane.URGENT else None)
                    for line in lines]
-        if not entries[-1].ends:
+        under_way = None
+        for e in entries:
+            if under_way is not None and e.msgid != under_way:
+                raise ValueError(f"submit whole messages: {e.line[:40]!r} cuts into another")
+            under_way = None if e.ends else e.msgid
+        if under_way is not None:
             raise ValueError(f"submit whole messages: {lines[-1][:40]!r} does not end one")
         ends = sum(e.ends for e in entries)
         if lane is Lane.TEXT:
@@ -314,10 +330,13 @@ class Pacer:
             return
         gone = [e for q in lanes for e in q if e.msgid == msgid]
         for lane, q in zip(Lane, lanes):
-            keep = [e for e in q if e.msgid != msgid]
+            mine = [e for e in q if e.msgid == msgid]
+            if not mine:
+                continue
             if lane is Lane.TEXT:
-                self._text_cost -= sum(e.cost for e in q if e.msgid == msgid)
-                self._text_messages[key] -= sum(e.ends for e in q if e.msgid == msgid)
+                self._text_cost -= sum(e.cost for e in mine)
+                self._text_messages[key] -= sum(e.ends for e in mine)
+            keep = [e for e in q if e.msgid != msgid]
             q.clear()
             q.extend(keep)
         self._left_a_gap(key, int(any(e.olm for e in gone)))
@@ -364,18 +383,31 @@ class Pacer:
             spent.popleft()
         return sum(cost for _, cost in spent)
 
-    def _within(self, key: str, lane: Lane, cost: int, now: float) -> bool:
-        """Whether the head message of a lane, its first line costing `cost`,
-        may start ahead of text: within the target's budget and the
-        connection's, the latter stretched for a target that drew nothing
-        else (FRESH_ALLOWANCE)."""
+    @staticmethod
+    def _head(q: deque) -> tuple[int, int]:
+        """(lines, bank cost) of a lane's head message, not yet started."""
+        lines = next(n for n, e in enumerate(q, 1) if e.ends)
+        return lines, sum(e.cost for e in islice(q, lines))
+
+    def _budget_rank(self, key: str, lane: Lane, now: float) -> int:
+        """Where the head message of an URGENT or REACTIVE lane, not yet
+        started, goes: ahead of text if all its lines fit the target's
+        budget and the connection's, behind it if not. A target that drew
+        nothing else from the lane in the window (nothing spent, one message
+        queued) stretches the connection's by FRESH_ALLOWANCE, and its KEYS
+        or NACK goes ahead of the rest of the lane: an honest peer's answer
+        never queues behind what others drew."""
         per_target, total = _BUDGETS[lane]
-        spent = self._spent_in(key, lane, now)
         q = self._queues[key][lane]
-        if not spent and (q[0].seq == q[-1].seq or q[0].msgid is not None
-                          and q[0].msgid == q[-1].msgid):
-            total += FRESH_ALLOWANCE
-        return spent + cost <= per_target and self._spent_in("", lane, now) + cost <= total
+        lines, cost = self._head(q)
+        spent = self._spent_in(key, lane, now)
+        fresh = not spent and lines == len(q)
+        if (spent + cost > per_target or self._spent_in("", lane, now) + cost
+                > total + (FRESH_ALLOWANCE if fresh else 0.0)):
+            return _PAST_BUDGET
+        if lane is Lane.URGENT:
+            return _URGENT
+        return _FRESH_REACTIVE if fresh else _REACTIVE
 
     def _starved(self, now: float) -> bool:
         # The wakeup's expression, so that the two agree to the last bit.
@@ -390,18 +422,21 @@ class Pacer:
             rank = (_STARVED_STARTED_TEXT if started else _STARVED_TEXT) if starved else _TEXT
         elif started:
             rank = _STARTED_URGENT if lane is Lane.URGENT else _STARTED_REACTIVE
-        elif self._within(key, lane, head.cost, now):
-            rank = _URGENT if lane is Lane.URGENT else _REACTIVE
         else:
-            rank = _PAST_BUDGET
+            rank = self._budget_rank(key, lane, now)
         return (rank, self._served.get(key, float("-inf")), head.seq)
 
     def _next(self, now: float):
         """(key, lane, entry) of the line whose turn it is, or None while
         every target waits on its window; then the earliest time a window
-        opens (or None). While a text message is under way, no other starts."""
+        opens (or None). While a message is under way, no other of its lane
+        starts."""
         heads, opens = [], []
-        writing = next((k for k, lane in self._open if lane is Lane.TEXT), None)
+        # One message of each lane under way at a time: a second order
+        # interleaving with the first makes both late, text messages taking
+        # turns age together past their receivers' minute, and each KEYS or
+        # NACK under way puts its rest ahead of the orders.
+        under_way = {lane: k for k, lane in self._open}
         starved = self._starved(now)
         for key, lanes in self._queues.items():
             slot = self._slot(key, now)
@@ -409,7 +444,7 @@ class Pacer:
                 opens.append(slot)
                 continue
             for lane in Lane:
-                if lanes[lane] and not (lane is Lane.TEXT and writing not in (None, key)):
+                if lanes[lane] and under_way.get(lane, key) == key:
                     head = lanes[lane][0]
                     heads.append((self._rank(key, lane, head, starved, now), key, lane, head))
         nxt = min(heads, key=lambda h: h[0])[1:] if heads else None
@@ -443,10 +478,10 @@ class Pacer:
             else:
                 for k in (key, ""):
                     self._spent.setdefault((k, lane), deque()).append((now, head.cost))
-            if head.ends:
-                self._open.pop((key, lane), None)
-            else:
+            if not head.ends:
                 self._open[(key, lane)] = head.msgid
+            elif self._open.get((key, lane)) == head.msgid:
+                self._open.pop((key, lane), None)    # a bare line has none
             self._sent[key].append(now)
             self._served[key] = now
             out.append((head.target, head.line))
@@ -534,7 +569,7 @@ class Pacer:
                 if lanes[lane]:
                     head = lanes[lane][0]
                     if head.msgid is None or self._open.get((key, lane)) != head.msgid:
-                        later += self._budget_recovers(key, lane, head.cost, now)
+                        later += self._budget_recovers(key, lane, self._head(lanes[lane])[1], now)
             later += [self._drop_at(cost, deadline, now)
                       for _, cost, deadline, _ in self._unstarted_deadlines(key, lanes)]
         if self._text_cost and self._text_at is not None:
@@ -543,12 +578,12 @@ class Pacer:
         return min(times) if times else None
 
     def _budget_recovers(self, key: str, lane: Lane, cost: int, now: float) -> list[float]:
-        """The instants at which a line of `cost` to `key` may come within
+        """The instants at which a message of `cost` to `key` may come within
         budget: the target's budget fitting it, the connection's fitting it
         with and without the allowance, the target's emptying (which may grant
-        the allowance; the rest of its condition changes only when lines are
-        queued or leave). Waking at one where nothing changes costs nothing;
-        missing one makes a line late."""
+        the allowance and the precedence; the rest of its condition changes
+        only when lines are queued or leave). Waking at one where nothing
+        changes costs nothing; missing one makes a line late."""
         per_target, total = _BUDGETS[lane]
         mine, conn = (key, lane), ("", lane)
         return [self._ages_out(mine, now, lambda left: left + cost <= per_target),
@@ -652,15 +687,23 @@ class PacedSender:
                         wake = self._pacer.next_wakeup(now)
                         self._cv.wait(None if wake is None else max(0.0, wake - now))
                         continue
-                lost += self._write(batch)
-                if self._on_lost is not None:
-                    for target, msgid, reason in lost:
-                        self._on_lost(target, msgid, reason)
+                for target, msgid, reason in lost + self._write(batch):
+                    self._report(target, msgid, reason)
         except Exception as exc:
             # Never a silent stop: whatever kills the thread, submit() says so.
             log.exception("pacer: thread died, nothing goes out any more")
             with self._cv:
                 self._died = exc
+
+    def _report(self, target: str, msgid: str | None, reason: str) -> None:
+        if self._on_lost is None:
+            return
+        try:
+            self._on_lost(target, msgid, reason)
+        except Exception:
+            # The application's callback failing is not the pacer failing:
+            # the other losses are still reported, and lines still go.
+            log.exception("pacer: on_lost failed for %s %s", target, msgid)
 
     def _write(self, batch: list[tuple[str, str]]) -> list[tuple[str, str | None, str]]:
         lost, failed = [], set()

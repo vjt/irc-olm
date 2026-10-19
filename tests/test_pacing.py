@@ -663,7 +663,7 @@ def test_holders_of_pinned_nicks_flooding_us_neither_delay_a_chal_nor_starve_tex
     ev.append((0.0, lambda _: p.submit("c", [L5] * 10, lane=Lane.TEXT)))     # 50 s of bank
     _, chal = order(p, "lucy", 95.0)
     left = poll(p, ev + [chal], until=300)
-    assert left["lucy"][-1][0] - 95.0 <= 7.0
+    assert left["lucy"][-1][0] - 95.0 <= 7.0 + 3           # behind the rest of one KEYS
     # Ahead of text, each takes at most REACTIVE_BUDGET and the rest of a
     # KEYS a minute, all of them REACTIVE_BUDGET_TOTAL and a KEYS: 50 s of
     # text leave within 50 / share minutes.
@@ -727,11 +727,12 @@ def test_a_started_reactive_message_finishes_before_turns_rotate(n):
 
 def test_reactive_lines_take_turns_by_target():
     # Three targets with reactive messages queued first: a fourth one's goes
-    # after one message of each, not after all of theirs.
+    # after one message of each, not after all of theirs. (Two messages: a
+    # single one would be fresh, and go first.)
     p = Pacer(fakelag=None)
     for f in ("mal0", "mal1", "mal2"):
         assert p.submit(f, [L2] * 3, lane=Lane.REACTIVE)
-    assert p.submit("vjt", [L2], lane=Lane.REACTIVE)
+    assert p.submit("vjt", [L2] * 2, lane=Lane.REACTIVE)
     order_ = [target for target, _ in p.due(1000.0)]
     assert order_.index("vjt") == 3
 
@@ -870,9 +871,12 @@ def test_turns_stay_bounded_while_a_target_never_served_stays_queued():
 
 
 def test_urgent_goes_before_reactive():
+    # Two NACKs each: a target with one message and nothing spent is fresh,
+    # and goes first (test_a_keys_for_a_peer_that_drew_nothing_...).
     p = Pacer(fakelag=None)
     for f in ("mal0", "mal1"):
-        assert p.submit(f, msg(f, 2, verb="NACK"), lane=Lane.REACTIVE)
+        for _ in range(2):
+            assert p.submit(f, msg(f, 2, verb="NACK"), lane=Lane.REACTIVE)
     assert p.submit("lucy", msg("lucy", 5, 4), lane=Lane.URGENT)
     assert [target for target, _ in p.due(1000.0)][:2] == ["lucy", "lucy"]
 
@@ -999,7 +1003,12 @@ def test_text_gets_a_line_every_text_floor_whatever_goes_ahead_of_it():
     left = poll(p, ev, until=600)
     ts = [t for t, line in left["lucy"] if line in reply]
     assert len(ts) == len(reply) and completed(left, "lucy") == 1
-    assert max(b - a for a, b in zip(ts, ts[1:])) <= TEXT_FLOOR + FAKE_LAG_CEILING + DEFAULT_WINDOW
+    assert max(b - a for a, b in zip(ts, ts[1:])) <= UNDER_WAY_BOUND
+
+
+# What the orders leave text of the bank, at most 45 s of each minute, in
+# 180 s measured: less the 10 s the bank may hold at either end.
+TEXT_LEFT_BY_ORDERS = 60 - URGENT_BUDGET - FRESH_ALLOWANCE - FAKE_LAG_CEILING * 60 / 180
 
 
 @pytest.mark.parametrize("k, every", [(2, 15.0), (2, 10.0), (3, 15.0), (2, 6.0), (4, 6.0)])
@@ -1013,7 +1022,7 @@ def test_humans_chatting_with_the_bot_leave_text_its_share(k, every):
     ev = [(5.0, lambda _: p.submit("lucy", reply, lane=Lane.TEXT))]
     left = poll(p, ev + [e for _, e in humans(p, k, every, until=200)], until=400)
     share = text_share(left, ("s0", "s1", "lucy"), 10.0, 190.0)
-    assert share >= 60 - URGENT_BUDGET - FRESH_ALLOWANCE - 6, share
+    assert share >= TEXT_LEFT_BY_ORDERS, share
     assert completed(left, "lucy") == 1
 
 
@@ -1138,14 +1147,16 @@ def test_bad_input_fails_in_the_caller_and_a_dead_thread_is_never_silent():
 
 
 def test_the_floor_fires_at_the_instant_the_wakeup_names():
-    # At this t0, (t0 + 30) - t0 rounds below 30: counting elapsed time
+    # At this t0, (t0 + 20) - t0 rounds below 20: counting elapsed time
     # instead missed the instant the wakeup named, and the text went at the
-    # KEYS's instant, 3 s late.
+    # KEYS's instant, 3 s late. (Two KEYS: a single one would be fresh, and
+    # go ahead of the starved text.)
     t0 = 1017.6509643838564
     lag = FakeLag()
     p = Pacer(fakelag=lag)
     lag.add(40, t0)                              # the application's own lines
-    assert p.submit("vjt", msg("vjt", 5, 3, verb="KEYS"), lane=Lane.REACTIVE)
+    for _ in range(2):
+        assert p.submit("vjt", msg("vjt", 5, 3, verb="KEYS"), lane=Lane.REACTIVE)
     assert p.submit("c", [L2], lane=Lane.TEXT)   # 2 s: room at a bank of 3
     released, now = {}, t0
     assert p.due(now) == []
@@ -1213,3 +1224,208 @@ def test_dropping_the_rest_of_a_message_frees_its_text_and_its_turn():
     p.drop("vjt", framing.parse(m[0]).msgid)
     assert p._text_cost == 15 and p._gap == {"vjt": 1}
     assert p.due(1000.0) == [("lucy", other[0])]
+
+
+# --- review J ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lane, costs, verb, bank", [(Lane.REACTIVE, (5, 3), "KEYS", 0),
+                                                     (Lane.URGENT, (5, 4), "MSG", 3)])
+def test_a_failed_write_of_an_order_or_a_keys_drops_the_rest_and_the_thread_lives(lane, costs, verb,
+                                                                                  bank):
+    # Review J, J1a: dropping the rest of a message for a target with no
+    # text queued raised KeyError, and the thread died with it.
+    import threading
+    lag, written, lost, done = FakeLag(), [], [], threading.Event()
+    clock = [1000.0]
+    lag.add(bank, 1000.0)
+    m = msg("vjt", *costs, verb=verb)
+
+    def send(target, line):
+        if line == m[0]:
+            raise OSError("socket gone")
+        written.append(line)
+
+    def on_lost(target, msgid, reason):
+        lost.append((target, msgid, reason))
+        done.set()
+
+    s = PacedSender(send, Pacer(fakelag=lag), clock=lambda: clock[0], on_lost=on_lost)
+    s.submit("vjt", m, lane=lane)
+    assert done.wait(2)
+    clock[0] = 1100.0                                  # the bank has long had room
+    assert s.submit("vjt", ["after"], lane=Lane.TEXT)
+    s._thread.join(0.3)
+    assert s._thread.is_alive() and m[1] not in written
+    assert lost == [("vjt", framing.parse(m[0]).msgid, "send-failed")]
+
+
+def test_an_on_lost_that_raises_is_logged_and_the_rest_still_reported():
+    # Review J, J6a: the application's callback failing killed the thread
+    # and ate the losses after it.
+    import threading
+    lag, calls, done = FakeLag(), [], threading.Event()
+    lag.add(30, 1000.0)
+
+    def on_lost(target, msgid, reason):
+        calls.append(target)
+        if len(calls) == 2:
+            done.set()
+        raise RuntimeError("callback broke")
+
+    s = PacedSender(lambda target, line: None, Pacer(fakelag=lag), clock=lambda: 1000.0,
+                    on_lost=on_lost)
+    for nick in ("vjt", "lucy"):
+        chal = msg(nick, 5, 4)
+        s.submit_all([(nick, b) for b in chal], {framing.parse(chal[0]).msgid: 15.0})
+    assert done.wait(2)
+    assert sorted(calls) == ["lucy", "vjt"] and s._thread.is_alive()
+
+
+def test_submit_refuses_lines_that_are_not_whole_messages_one_after_another():
+    # Review J, J1b: only the last line was checked.
+    p = Pacer(fakelag=FakeLag())
+    a, b = msg("vjt", 5, 4), msg("vjt", 5)
+    with pytest.raises(ValueError):
+        p.submit("vjt", [a[0]] + b, lane=Lane.URGENT)
+    assert p.pending() == 0
+    assert p.submit("vjt", a + b, lane=Lane.URGENT)
+
+
+def test_one_order_under_way_at_a_time():
+    # Review J, J5a: an order whose target's window held its next line let
+    # another start; the two took turns and both finished past the time an
+    # ACK could still come back.
+    p = Pacer(fakelag=FakeLag())
+    for _ in range(2):
+        assert p.submit("h0", msg("h0", 2, verb="NACK"), lane=Lane.REACTIVE)
+    a, b = msg("h0", 6, 6, 4), msg("h3", 5, 5, 4)
+    ev = [(1.0, lambda now: p.submit("h0", a, lane=Lane.URGENT, deadline=now + 15.0)),
+          (1.5, lambda now: p.submit("h3", b, lane=Lane.URGENT, deadline=now + 15.0))]
+    left = poll(p, ev, until=60)
+    sent = {line: t for target in left for t, line in left[target]}
+    assert sent[a[-1]] <= 1.0 + 15.0 - ACK_MARGIN
+    if b[0] in sent:
+        assert sent[b[0]] >= sent[a[-1]] and sent[b[-1]] <= 1.5 + 15.0 - ACK_MARGIN
+
+
+# Between two lines of a text message under way, at worst: the floor, the
+# rest of one order under way (two lines, 10 s of bank), the bank emptying
+# for the text line, and the target's window.
+UNDER_WAY_BOUND = TEXT_FLOOR + 10 + FAKE_LAG_CEILING + DEFAULT_WINDOW
+
+
+def test_a_message_under_way_keeps_inside_the_receivers_minute_behind_orders():
+    # Review J, J3a: two orders under way at the floor went first, then the
+    # bank had to empty for the text line: 58 s between two fragments. The
+    # NACKs fill h1's window, so its CHAL's second line waits; an ACK to h2
+    # comes just before the floor.
+    p = Pacer(fakelag=FakeLag())
+    reply = msg("lucy", *([6] * 14))
+    nacks = [msg("h1", 2, verb="NACK") for _ in range(2)]
+    a, b = msg("h1", 6, 6, 4), msg("h2", 5, 5, 4)
+    ev = [(0.0, lambda _: p.submit("lucy", reply, lane=Lane.TEXT)),
+          (12.5, lambda _: p.submit("p1", msg("p1", 5, 3, verb="KEYS"), lane=Lane.REACTIVE)),
+          (12.5, lambda _: p.submit("p2", msg("p2", 5, 3, verb="KEYS"), lane=Lane.REACTIVE)),
+          (12.5, lambda _: p.submit("p3", msg("p3", 2, verb="NACK"), lane=Lane.REACTIVE)),
+          (35.5, lambda _: [p.submit("h1", n, lane=Lane.REACTIVE) for n in nacks]),
+          (36.1, lambda _: p.submit("h2", b, lane=Lane.URGENT))]
+
+    def after(now, batch):
+        if any(line == nacks[-1][0] for _, line in batch):
+            p.submit("h1", a, lane=Lane.URGENT, deadline=now + 15.0)
+    left = poll(p, ev, until=400, after=after)
+    ts = [t for t, _ in left["lucy"]]
+    assert len(ts) == len(reply) and completed(left, "lucy") == 1
+    assert max(y - x for x, y in zip(ts, ts[1:])) <= UNDER_WAY_BOUND
+
+
+from irc_olm.engine import KEYREQ_RETRY  # noqa: E402
+
+
+def window_peak(left, targets, window=60.0):
+    """The most bank the lines to `targets` took in any `window` seconds,
+    on poll()'s rounded times counted in hundredths: a line `window` s old
+    is out of it, as in the pacer's budgets."""
+    rel = sorted((round(t * 100), FakeLag.cost(f"PRIVMSG {tg} :{line}"))
+                 for tg in targets for t, line in left.get(tg, []))
+    return max((sum(c for u, c in rel[:i + 1] if u + window * 100 > t)
+                for i, (t, _) in enumerate(rel)), default=0)
+
+
+def chatty(p, k, every, seed, until):
+    """`k` pinned humans at random phases, each addressing the bot about
+    every `every` s with orders of random shapes: [(lines, (at, fn))]."""
+    rng = random.Random(seed)
+    chats = []
+    for i in range(k):
+        start, gap = rng.uniform(5, 25), every * rng.uniform(0.8, 1.2)
+        chats += [order(p, f"h{i}", start + gap * j, rng.choice([(5, 4), (6, 5), (6, 3)]))
+                  for j in range(int((until - start) / gap))]
+    return chats
+
+
+@pytest.mark.parametrize("k, every, seed", [(1, 2.0, 0), (6, 20.0, 0), (6, 9.0, 5), (6, 7.0, 1)])
+def test_orders_never_take_more_than_their_budget_in_any_minute(k, every, seed):
+    # Review J, J4b: the budget was checked on a message's first line only,
+    # so an order of 6 + 5 s started at 30 s spent ended at 41, and the
+    # orders took up to 51 s of a minute.
+    p = Pacer(fakelag=FakeLag())
+    streams(p, "s0", "s1")
+    left = poll(p, [e for _, e in chatty(p, k, every, seed, until=260)], until=260)
+    peak = window_peak(left, [f"h{i}" for i in range(k)])
+    assert peak <= URGENT_BUDGET + (FRESH_ALLOWANCE if k > 1 else 0), peak
+    share = text_share(left, ("s0", "s1"), 60.0, 240.0)
+    assert share >= TEXT_LEFT_BY_ORDERS, share
+
+
+@pytest.mark.parametrize("at", [100.0 + 0.75 * i for i in range(0, 40, 3)])
+def test_an_honest_keys_leaves_before_its_asker_asks_again_behind_chatting_humans(at):
+    # Review J, J4a: orders within budget and starved text both went ahead
+    # of a KEYS, which needs an empty bank for its 5 s line: with four
+    # humans addressing the bot every 6 s the KEYS waited up to 50 s, and
+    # the asker re-asks at KEYREQ_RETRY.
+    p = Pacer(fakelag=FakeLag())
+    streams(p, "s0", "s1")
+    keys = msg("vjt", 5, 3, verb="KEYS")
+    ev = [e for _, e in humans(p, 4, 6.0, until=at + 60)]
+    ev += [(at, lambda _: p.submit("vjt", keys, lane=Lane.REACTIVE))]
+    left = poll(p, ev, until=at + 60)
+    sent = {line: t for t, line in left.get("vjt", [])}
+    assert sent.get(keys[-1], math.inf) - at <= KEYREQ_RETRY - 5, sent
+
+
+def test_a_keys_for_a_peer_that_drew_nothing_goes_ahead_of_older_ones():
+    # Review J, J4a: a target that drew nothing in the minute only had its
+    # cap raised; its KEYS queued behind every older KEYS of targets never
+    # served, first come first served. (Eight nicks each drawing one KEYS a
+    # minute are another matter: each is fresh too, and together they draw
+    # twice what the budget lets ahead of text: the README's known limit.)
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    lag.add(10, 0.0)                             # the application's own lines
+    mals = ("mal0", "mal1", "mal2")
+    for f in mals:
+        for _ in range(2):
+            assert p.submit(f, msg(f, 5, 3, verb="KEYS"), lane=Lane.REACTIVE)
+    keys = msg("vjt", 5, 3, verb="KEYS")
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    left = poll(p, [], until=120)
+    assert [line for _, line in left["vjt"]] == keys
+    assert left["vjt"][-1][0] <= min(left[f][0][0] for f in mals)
+
+
+def test_one_reactive_message_under_way_at_a_time():
+    # Started REACTIVE messages go ahead of orders, so that no order cuts
+    # an honest KEYS in two; two under way would put the rest of each ahead
+    # of a CHAL. mal0's window holds the rest of its KEYS.
+    p = Pacer(fakelag=None)
+    for f in ("mal0", "mal1"):
+        assert p.submit(f, msg(f, 2, verb="NACK"), lane=Lane.REACTIVE)
+    assert p.submit("mal0", msg("mal0", 2, verb="NACK"), lane=Lane.REACTIVE)
+    a, b = msg("mal0", 5, 3, verb="KEYS"), msg("mal1", 5, 3, verb="KEYS")
+    assert p.submit("mal0", a, lane=Lane.REACTIVE)
+    assert p.submit("mal1", b, lane=Lane.REACTIVE)
+    left = poll(p, [], until=30)
+    sent = {line: t for target in left for t, line in left[target]}
+    assert sent[a[0]] < sent[a[-1]] <= sent[b[0]]
