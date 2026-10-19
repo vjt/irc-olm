@@ -1564,13 +1564,16 @@ def test_a_fresh_keys_waits_its_patience_then_goes_ahead_of_the_orders_queued_af
         assert (released[k[0]][1] < place) == (times[i] < 8.0), (i, released[k[0]], at)
 
 
-def test_a_fresh_keys_that_waited_takes_the_reserve_and_no_keys_under_way_holds_it_back():
+def test_a_fresh_keys_that_waited_takes_the_reserve_ahead_of_a_keys_under_way_short_of_its_floor():
     # Review K: a KEYS under way to a target that is not fresh (another one
     # queued) ranks below the orders and text past the floor, and keeps the
     # reserve, so it must not hold the lane: KEYS and NACKs to different
     # targets interleave. The application keeps the bank at about 5 s for
     # 20 s: mal0's 3 s tail cannot go, and an honest peer's KEYS, fresh,
-    # goes once its patience is out, taking the reserve.
+    # goes once its patience is out, at 9 s, taking the reserve. Review M,
+    # M1a: past its floor (20 s) mal0's tail goes first, or its receiver may
+    # never complete it: at 23, once the bank has room; the honest KEYS's
+    # at 26, 25.5 s after it was asked for, inside KEYREQ_RETRY.
     lag = FakeLag()
     p = Pacer(fakelag=lag)
     mal = [msg("mal0", 5, 3, verb="KEYS") for _ in range(2)]
@@ -1581,20 +1584,23 @@ def test_a_fresh_keys_that_waited_takes_the_reserve_and_no_keys_under_way_holds_
     ev = [(0.5, lambda _: p.submit("vjt", keys, lane=Lane.REACTIVE))]
     ev += [(0.5 + i, lambda now: lag.add(1, now)) for i in range(20)]   # the application's
     released = released_by_wakeups(p, 0.0, ev)
-    assert released[keys[0]][0] <= 0.5 + 8.0 + 1.0
+    assert released[keys[0]][0] == 9.0
     assert released[keys[0]][1] < released[mal[0][-1]][1]
-    assert released[keys[-1]][0] - 0.5 <= KEYREQ_RETRY - 5
+    assert released[mal[0][-1]][0] == 23.0 and released[keys[-1]][0] == 26.0
+    assert released[keys[-1]][0] - 0.5 < KEYREQ_RETRY
 
 
 def paid(p):
     return sum(c for _, c in p._spent.get((_PAID, Lane.URGENT), ()))
 
 
-def test_a_fresh_answer_pays_for_what_of_it_goes_ahead_once_and_nothing_else():
+def test_a_fresh_answer_pays_once_for_what_is_left_of_it_when_its_patience_runs_out():
     # Review K, K2a: what goes ahead of the orders or of text past the
     # floor is paid for, a fresh peer's KEYS included: all the rest of it
-    # when it first goes ahead, once. Review L, L4a: one that goes with
-    # nothing to go ahead of pays nothing.
+    # when it first goes at that rank, once. Review L, L4a: one that goes
+    # before its patience is out pays nothing. Review M, M4a: the rank pays
+    # (its patience out, the allowance with room for it), not what it
+    # overtook: held by the application's lines alone, it pays all the same.
     p = Pacer(fakelag=FakeLag())
     keys = msg("vjt", 5, 3, verb="KEYS")
     assert p.submit("vjt", keys, lane=Lane.REACTIVE)
@@ -1940,13 +1946,15 @@ def test_an_order_past_its_budget_holds_no_fresh_keys_back_and_the_rest_waits_on
     assert [released[line][0] for line in keys[:1] + fifth + keys[1:] + keyreq] == [10.0, 15.0, 19.0, 22.0, 25.0]
 
 
-def test_the_rest_of_a_fresh_keys_goes_behind_an_older_order_held_by_its_window_and_pays():
+def test_the_rest_of_a_fresh_keys_leaves_the_reserve_to_an_older_order_held_by_its_window_and_pays():
     # Review L, L4a and L4b: a fresh KEYS that started with nothing ahead
     # paid nothing; past its patience its rest goes ahead of text past the
     # floor and pays, but behind an order queued before. lucy's order,
-    # queued at 6 s, waits for lucy's window (three lines at 5, 5 and 7):
-    # the rest goes at 10, at the orders' limit (a bank of 7), the order at
-    # 15 and 19.
+    # queued at 6 s, waits for lucy's window (three lines at 5, 5 and 7).
+    # Review M, M1c: the rest went in that gap, at 10, taking the reserve,
+    # and the order then waited on the bank (15 and 19 s): behind an older
+    # order the rest leaves it the reserve, so the order goes at 12 and 16,
+    # the rest at 19.
     lag = FakeLag()
     p = Pacer(fakelag=lag)
     keys = msg("vjt", 5, 3, verb="KEYS")
@@ -1958,7 +1966,7 @@ def test_the_rest_of_a_fresh_keys_goes_behind_an_older_order_held_by_its_window_
           (6.0, lambda now: p.submit("lucy", older, lane=Lane.URGENT))]
     released = released_by_wakeups(p, 0.0, ev)
     assert [released[a[0]][0] for a in acks] == [5.0, 5.0, 7.0]
-    assert [released[line][0] for line in keys[1:] + older] == [10.0, 15.0, 19.0]
+    assert [released[line][0] for line in older + keys[1:]] == [12.0, 16.0, 19.0]
     assert paid(p) == 3
 
 
@@ -1998,10 +2006,11 @@ def test_the_floor_of_a_keys_under_way_runs_from_its_own_last_line():
         10.0, 13.0, 18.0, 20.0, 24.0, 32.0]
 
 
-def test_a_keys_under_way_finishes_before_another_first_contacts_starts():
-    # Two first contacts in a row: the second's KEYS, fresh, does not cut
-    # the first's in two. The first's 3 s rest goes at 3 s, at the
-    # reserve's limit; the second's 5 s line needs an empty bank, at 8.
+def test_a_keys_under_way_finishes_before_another_first_contact_starts_within_its_patience():
+    # Two first contacts in a row: the second's KEYS, fresh and within its
+    # patience, does not cut the first's in two. The first's 3 s rest goes
+    # at 3 s, at the reserve's limit; the second's 5 s line needs an empty
+    # bank, at 8. (Past its patience it may: the floor bounds the wait.)
     p = Pacer(fakelag=FakeLag())
     first, second = msg("ann", 5, 3, verb="KEYS"), msg("vjt", 5, 3, verb="KEYS")
     assert p.submit("ann", first, lane=Lane.REACTIVE)
@@ -2075,3 +2084,104 @@ def test_a_second_human_and_a_first_contact_share_one_allowance():
     released = released_by_wakeups(p, 0.0, ev)
     assert released[keys[0]][0] == 8.0 and released[orders[-1][-1]][0] == 46.0
     assert released[h1[0]][0] == 68.0
+
+
+# --- review M: the floor of a message under way, what the orders keep -----
+
+from irc_olm.pacing import FRESH_PATIENCE  # noqa: E402
+
+
+def test_a_keys_under_way_past_its_floor_goes_before_first_contacts_that_waited():
+    # Review M, M1a: the rest of a KEYS or NACK under way past its floor
+    # ranked below a first contact's KEYS that had waited, and each of those
+    # had the turn first (never served): behind four of them the recovery
+    # KEYS's second line left 51 s after its first, and with the
+    # application's lines on top a receiver never completed one. It goes
+    # with text under way past the floor now, at its floor: 20 s. The
+    # application keeps the bank between 5.5 and 6.5 s until then, which
+    # its 3 s line fits with the reserve and no 5 s line does.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    nack, keys = msg("vjt", 2, verb="NACK"), msg("vjt", 5, 3, verb="KEYS")
+    assert p.submit("vjt", nack, lane=Lane.REACTIVE)
+    assert p.due(-5.0) == [("vjt", nack[0])]     # the recovery: not fresh
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(0.0) == [("vjt", keys[0])]
+    lag.add(1, 0.0)                              # the application's own lines
+    pz = [msg(f"pz{i}", 5, 3, verb="KEYS") for i in range(4)]
+    ev = [(1.0, lambda now: [p.submit(f"pz{i}", m, lane=Lane.REACTIVE) for i, m in enumerate(pz)])]
+    ev += [(0.5 + i, lambda now: lag.add(1, now)) for i in range(20)]   # the application's
+    released = released_by_wakeups(p, 0.0, ev)
+    assert released[keys[-1]][0] == TEXT_FLOOR
+    assert all(released[keys[-1]][1] < released[m[0]][1] for m in pz)
+
+
+def test_a_fresh_keys_under_way_past_its_floor_goes_before_the_orders_queued_before_its_patience_ran_out():
+    # Review M, M1a: the rest of a fresh peer's KEYS that started with
+    # nothing ahead, once its patience was out, ranked behind the orders
+    # queued before that instant, even past its floor: behind four orders,
+    # the application's lines slowing the bank to half speed, it left 74 s
+    # after its first line, and its receiver never completed it. Its floor
+    # comes first: at 20 s it goes next after h0's order under way.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    keys = msg("vjt", 5, 3, verb="KEYS")
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(0.0) == [("vjt", keys[0])]
+    lag.add(1, 0.0)                              # the application's own lines
+    chals = [msg(f"h{i}", 5, 4) for i in range(4)]
+    ev = [(1.0 + i, lambda now, i=i: p.submit(f"h{i}", chals[i], lane=Lane.URGENT))
+          for i in range(4)]
+    ev += [(0.5 + i, lambda now: lag.add(1, now)) for i in range(4)]    # the application's
+    ev += [(4.5 + 2 * i, lambda now: lag.add(1, now)) for i in range(40)]
+    released = released_by_wakeups(p, 0.0, ev)
+    assert [released[line][0] for line in chals[0] + keys[1:]] == [6.0, 14.0, TEXT_FLOOR]
+    assert released[keys[-1]][1] < released[chals[1][0]][1]
+
+
+def test_a_paid_keys_under_way_past_its_floor_goes_before_first_contacts_never_served():
+    # Review M, M1a: what a fresh KEYS paid kept its rest at the first
+    # contacts' rank past its floor, where every first contact never served
+    # had the turn first. vjt's KEYS, held by the application's lines, goes
+    # at 8 s and pays; four first contacts' KEYS have waited from 9; the
+    # application keeps the bank between 5.5 and 6.5 s, which no 5 s line
+    # fits: at its floor, 28 s, vjt's 3 s rest goes first.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    keys = msg("vjt", 5, 3, verb="KEYS")
+    lag.add(12, 0.0)                             # the application's own lines
+    assert p.submit("vjt", keys, lane=Lane.REACTIVE)
+    assert p.due(0.0) == []
+    pz = [msg(f"pz{i}", 5, 3, verb="KEYS") for i in range(4)]
+    ev = [(1.0, lambda now: [p.submit(f"pz{i}", m, lane=Lane.REACTIVE) for i, m in enumerate(pz)])]
+    ev += [(11.5 + i, lambda now: lag.add(1, now)) for i in range(17)]  # the application's
+    released = released_by_wakeups(p, 0.0, ev)
+    assert released[keys[0]][0] == FRESH_PATIENCE
+    assert released[keys[-1]][0] == FRESH_PATIENCE + TEXT_FLOOR
+    assert all(released[keys[-1]][1] < released[m[0]][1] for m in pz)
+
+
+def test_first_contacts_that_paid_before_the_orders_leave_them_their_own_budget():
+    # Review M, M1b: what first contacts paid to go ahead never comes out of
+    # the orders' own 36 s, even when they paid first, so then more than 45 s
+    # a minute go ahead of text past the floor: the price of a human's orders
+    # never failing because strangers arrived first. Four first contacts'
+    # KEYS, held by the application's lines, pay 32 s by 35 s; one human's
+    # four orders, queued at 36, 45, 54 and 63, all leave 3 s after they
+    # come. Holding the orders to the allowance as well dropped the last two.
+    lag = FakeLag()
+    p = Pacer(fakelag=lag)
+    streams(p, "s0", "s1")
+    lag.add(12, 0.0)                             # the application's own lines
+    pz = [msg(f"pz{i}", 5, 3, verb="KEYS") for i in range(4)]
+    for i, m in enumerate(pz):
+        assert p.submit(f"pz{i}", m, lane=Lane.REACTIVE)
+    assert p.due(0.0) == []
+    orders, seen = [msg("h0", 5, 4) for _ in range(4)], []
+    ev = [(36.0 + 9.0 * i, lambda now, o=o: p.submit("h0", o, lane=Lane.URGENT, deadline=now + 15.0))
+          for i, o in enumerate(orders)]
+    ev += [(35.0, lambda now: seen.append(paid(p)))]
+    released = released_by_wakeups(p, 0.0, ev)
+    assert seen == [32]
+    assert [released[o[0]][0] for o in orders] == [39.0, 48.0, 57.0, 66.0]
+    assert not p.take_dropped()

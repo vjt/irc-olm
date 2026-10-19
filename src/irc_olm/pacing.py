@@ -39,14 +39,15 @@ only if it can still be answered. TEXT has no budget, and a floor instead:
 text queued and no text line for TEXT_FLOOR seconds, a text message under
 way goes next after an order under way, so it reaches its receiver (who
 drops a partial message 60 s after its last fragment); one not started goes
-after the orders and the first contacts' KEYS, all within one budget. A
-KEYS or NACK under way has that floor too, from its own last line. Turns go
-to the target served longest ago, in every lane; within a target each lane
-keeps its order, so a short message never overtakes a long one sent before
-it, which its reader would see reversed. REACTIVE and TEXT lines never take
-the bank past a reserve kept for URGENT ones, so a CHAL behind a stream of
-text leaves within seconds, but a KEYS or NACK going ahead of text past the
-floor takes it, as the orders do.
+after the orders and the first contacts' KEYS. A KEYS or NACK under way
+has that floor too, from its own last line, and takes turns with text under
+way past it. Turns go to the target served longest ago, in every lane;
+within a target each lane keeps its order, so a short message never
+overtakes a long one sent before it, which its reader would see reversed.
+REACTIVE and TEXT lines never take the bank past a reserve kept for URGENT
+ones, so a CHAL behind a stream of text leaves within seconds, but the rest
+of a KEYS or NACK past its floor, and a first contact's KEYS going ahead of
+every order, take it, as the orders do.
 """
 
 from __future__ import annotations
@@ -83,11 +84,12 @@ FULL_LINE_COST = 6
 FAKE_LAG_CEILING = 10.0
 # Seconds of bank REACTIVE and TEXT lines leave free for URGENT ones: they
 # never take the bank past FAKE_LAG_CEILING - RESERVE, except a line dearer
-# than that, which goes at an empty bank (a full line costs 6 s), and a KEYS
-# or NACK going ahead of text past the floor, which takes the reserve as the
-# orders do. Text loses no throughput (the bank drains a second a second
-# either way), and a 2-line CHAL behind streaming text leaves within 7 s
-# instead of 11.
+# than that, which goes at an empty bank (a full line costs 6 s), and the rest
+# of a KEYS or NACK past its floor and a first contact's KEYS going ahead of
+# every order, which take the reserve as the orders do (behind an older order
+# a KEYS leaves it to that order). Text loses no throughput (the bank drains a
+# second a second either way), and a 2-line CHAL behind streaming text leaves
+# within 7 s instead of 11.
 RESERVE = 5.0
 # Bank seconds that may go ahead of text in BUDGET_WINDOW, decided when a
 # message's first line is due, on all its lines: a message that starts
@@ -107,23 +109,27 @@ REACTIVE_BUDGET_TOTAL = 22.0
 # one message more for all such targets together: an honest peer behind
 # flooders, a second human behind a chatty one. Its KEYS or NACK goes ahead
 # of the rest of the lane. URGENT's allowance is also what a first
-# contact's KEYS pays from to go ahead of the orders (FRESH_PATIENCE): the
-# orders keep their own budget, and the orders, the second human and the
-# first contacts together never take more than URGENT_BUDGET +
-# FRESH_ALLOWANCE ahead of text past the floor. A flooder held back by the
-# budget always has more queued.
+# contact's KEYS pays from to go ahead of the orders (FRESH_PATIENCE): it
+# pays while the orders, the second human and what the first contacts paid
+# fit URGENT_BUDGET + FRESH_ALLOWANCE, and the orders keep their own budget
+# whatever was paid. So ahead of text past the floor a minute holds at most
+# that much when the orders spend first, and the orders' budget on top of
+# what was paid when the first contacts pay first: the price of a human's
+# orders never failing because strangers came first. A flooder held back by
+# the budget always has more queued.
 FRESH_ALLOWANCE = 9.0
 BUDGET_WINDOW = 60.0
 # A fresh target's KEYS waits behind the orders not yet started, and behind
-# text past the floor, for this long. Then it goes ahead of the orders
-# queued after that instant (those queued before keep their place, waiting
-# on the bank or not: a CHAL arriving meanwhile, 15 s to be answered, still
-# goes first) and of text past the floor, takes the reserve, and pays for
-# what of it goes ahead from URGENT's allowance: one first contact a minute
-# while the orders are at their budget. Its asker asks again at
-# KEYREQ_RETRY (30 s) and drops what it queued at OUTQ_TTL (60 s). A NACK
-# has no asker waiting (its sender keeps the message SENT_MEMORY) and never
-# goes ahead of the orders.
+# text past the floor, for this long. Then it goes ahead of the orders queued
+# after that instant (those queued before keep their place, waiting on the
+# bank or on their target's window: a CHAL arriving meanwhile, 15 s to be
+# answered, still goes first, and the KEYS behind it leaves it the reserve)
+# and of text past the floor, takes the reserve ahead of them all, and pays
+# for the rest of it, once, from URGENT's allowance: one first contact a
+# minute while the orders are at their budget. Its asker asks again at
+# KEYREQ_RETRY (30 s) and drops what it queued at OUTQ_TTL (60 s). A NACK has
+# no asker waiting (its sender keeps the message SENT_MEMORY) and never goes
+# ahead of the orders.
 FRESH_PATIENCE = 8.0
 # Text queued and no text line released for this long: a text message under
 # way goes next after an order under way, one not started after the orders
@@ -131,8 +137,8 @@ FRESH_PATIENCE = 8.0
 # TEXT_FLOOR, plus the rest of one order (10 s), the bank emptying for the
 # text line (10 s) and the target's window (6 s): 46 s, inside the 60 s its
 # receiver keeps it. The rest of a KEYS or NACK whose last line left this
-# long ago goes next after text under way past the floor and the first
-# contacts' KEYS, taking the reserve: inside the same 46 s.
+# long ago takes turns with it, taking the reserve: the same 46 s, plus a
+# line for every other message under way past its floor at that instant.
 TEXT_FLOOR = 20.0
 # A CHAL starts only if its last line can leave this long before its
 # deadline at the bank as it stands: the ACK's way back (the peer's decrypt,
@@ -243,18 +249,18 @@ _BUDGETS = {Lane.URGENT: (URGENT_BUDGET, URGENT_BUDGET),
             Lane.REACTIVE: (REACTIVE_BUDGET, REACTIVE_BUDGET_TOTAL)}
 
 # Ranks, the lowest goes first; then turns (the target served longest ago),
-# then the order of submission: an order under way, text under way past the
-# floor, a fresh target's KEYS that has waited FRESH_PATIENCE (under way or
-# not, no order queued before that instant still waiting within budget), a
-# KEYS or NACK under way past the floor, the orders within budget, a fresh
-# target's KEYS that has waited but behind such an order, text past the
-# floor, another KEYS or NACK under way, a fresh target's, the rest within
-# budget, text, and whatever is past its budget. What goes ahead of text past
-# the floor, but what is under way, is the orders and what the fresh KEYS
-# paid, within URGENT_BUDGET + FRESH_ALLOWANCE.
-(_STARTED_URGENT, _STARVED_STARTED_TEXT, _FRESH_FIRST, _STARVED_STARTED_REACTIVE, _URGENT,
- _FRESH_NEXT, _STARVED_TEXT, _STARTED_REACTIVE, _FRESH_REACTIVE, _REACTIVE, _TEXT,
- _PAST_BUDGET) = range(12)
+# then the order of submission: an order under way, a message under way past
+# its floor (text, or a KEYS or NACK), a fresh target's KEYS that has waited
+# FRESH_PATIENCE (under way or not, no order queued before that instant still
+# waiting within budget), the orders within budget, a fresh target's KEYS
+# that has waited but behind such an order, text past the floor, another
+# KEYS or NACK under way, a fresh target's, the rest within budget, text, and
+# whatever is past its budget. What goes ahead of text past the floor, but
+# what is under way, is the orders and what the fresh KEYS paid: the orders
+# within their own budget (the allowance for a second human), the KEYS
+# within URGENT_BUDGET + FRESH_ALLOWANCE less what the orders had spent.
+(_STARTED_URGENT, _STARVED_STARTED, _FRESH_FIRST, _URGENT, _FRESH_NEXT, _STARVED_TEXT,
+ _STARTED_REACTIVE, _FRESH_REACTIVE, _REACTIVE, _TEXT, _PAST_BUDGET) = range(11)
 
 # What fresh KEYS paid to go ahead of the orders: a budget window like the
 # others (a target is a nick, never with a space in it).
@@ -447,9 +453,9 @@ class Pacer:
         nothing else from the lane in the window (nothing spent, one message
         queued) may use the connection's allowance (_allowed), and its KEYS
         or NACK goes ahead of the rest of the lane: an honest peer's answer
-        never queues behind what others drew. Its KEYS, once it has waited
-        FRESH_PATIENCE, goes ahead of the orders not yet started too, if the
-        allowance has room for it."""
+        does not queue behind the backlog others drew. Its KEYS, once it
+        has waited FRESH_PATIENCE, goes ahead of the orders queued since
+        too (_ahead), if the allowance has room for it."""
         per_target, total = _BUDGETS[lane]
         q = self._queues[key][lane]
         lines, cost = self._head(q)
@@ -462,7 +468,8 @@ class Pacer:
             return _URGENT
         if not fresh:
             return _REACTIVE
-        return (q[0].keys and self._ahead(key, cost, now)) or _FRESH_REACTIVE
+        ahead = self._ahead(key, cost, now) if q[0].keys else None
+        return _FRESH_REACTIVE if ahead is None else ahead
 
     def _allowed(self, lane: Lane, cost: int, now: float) -> bool:
         """Whether `cost` more fits the connection's budget stretched by
@@ -512,19 +519,21 @@ class Pacer:
         if lane is Lane.TEXT:
             # Starved, a message under way goes before any order: its
             # receiver would drop it. One not started yields to the orders.
-            rank = (_STARVED_STARTED_TEXT if started else _STARVED_TEXT) if starved else _TEXT
+            rank = (_STARVED_STARTED if started else _STARVED_TEXT) if starved else _TEXT
         elif started and lane is Lane.URGENT:
             rank = _STARTED_URGENT
+        elif started and now >= self._last_reactive(key) + TEXT_FLOOR:
+            # The floor, from its own last line (the wakeup's expression),
+            # before what it paid or waited: those only ever raise it.
+            rank = _STARVED_STARTED
         elif started and key in self._paid:
             # Paid for, a fresh KEYS's rest stays ahead.
             rank = _FRESH_NEXT if self._order_before(key, now) else _FRESH_FIRST
         elif started and key in self._fresh and (
-                ahead := self._ahead(key, self._head(self._queues[key][lane])[1], now)):
+                ahead := self._ahead(key, self._head(self._queues[key][lane])[1], now)) is not None:
             rank = ahead                     # started with nothing ahead, it waited
         elif started:
-            # The floor's expression, from its own last line, as the wakeup's.
-            rank = (_STARVED_STARTED_REACTIVE if now >= self._last_reactive(key) + TEXT_FLOOR
-                    else _STARTED_REACTIVE)
+            rank = _STARTED_REACTIVE
         else:
             rank = self._budget_rank(key, lane, now)
         return (rank, self._served.get(key, float("-inf")), head.seq)
@@ -555,9 +564,11 @@ class Pacer:
         return (key, lane, head, rank[0]), min(opens) if opens else None
 
     def _limit(self, lane: Lane, rank: int) -> float:
-        # A KEYS or NACK going ahead of text past the floor takes the
-        # reserve, as the orders do.
-        urgent = lane is Lane.URGENT or lane is Lane.REACTIVE and rank < _STARVED_TEXT
+        # The rest of a KEYS or NACK under way past its floor, and a first
+        # contact's KEYS going ahead of every order, take the reserve as the
+        # orders do; one behind an older order leaves it to that order.
+        urgent = lane is Lane.URGENT or (lane is Lane.REACTIVE
+                                         and rank in (_STARVED_STARTED, _FRESH_FIRST))
         return self.fakelag.ceiling - (0.0 if urgent else RESERVE)
 
     def due(self, now: float) -> list[tuple[str, str]]:
@@ -700,9 +711,9 @@ class Pacer:
                         later += self._budget_recovers(key, lane, cost, now)
                         if lane is Lane.REACTIVE:
                             later += self._patience_ends(key, cost, now)
-                    elif lane is Lane.REACTIVE and key not in self._paid:
+                    elif lane is Lane.REACTIVE:
                         later.append(self._last_reactive(key) + TEXT_FLOOR)
-                        if key in self._fresh:
+                        if key in self._fresh and key not in self._paid:
                             later += self._patience_ends(key, cost, now)
             later += [self._drop_at(cost, deadline, now)
                       for _, cost, deadline, _ in self._unstarted_deadlines(key, lanes)]
