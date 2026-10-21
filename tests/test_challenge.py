@@ -92,8 +92,8 @@ def test_ack_after_expiry_without_a_tick_is_rejected_as_expired(net):
 # --- a challenge that cannot go is its order's expiry, never a lost message ------
 #
 # A CHAL is no message the application wrote: when it cannot go, its order ends
-# as ChallengeExpired, and a SendFailed counting it as well reports a lost
-# reply that nobody sent.
+# in the challenge book (ChallengeExpired, unless an ACK still comes back), and
+# a SendFailed counting it as well reports a lost reply that nobody sent.
 
 def paired(net):
     bot, vjt = net.add("bot"), net.add("vjt")
@@ -129,6 +129,26 @@ def test_keys_that_come_back_after_a_challenge_expired_still_open_the_session(ne
     assert net.captured("PKMSG", "bot") == []       # the CHAL is not sent
     r = bot.send("vjt", {"t": "text", "body": "a reply"})
     assert not [e for e in r.events if isinstance(e, SendQueued)]
+
+
+@pytest.mark.parametrize("wait", [0, OUTQ_TTL + 1], ids=["queued", "queue-timed-out"])
+def test_keys_from_another_pinned_key_open_no_session_for_it(net, wait):
+    # The queue is what ties solicited keys to a key: a pinned key answering
+    # the KEYREQ sent to another nick opens nothing, whether what was queued
+    # there is still waiting or already timed out.
+    bot, vjt = net.add("bot"), net.add("vjt")
+    eve = net.add("eve")
+    net.pair("bot", "vjt")
+    net.pair("bot", "eve")
+    net.drop = lambda *_: True
+    r = bot.send("vjt", {"t": "text", "body": "for vjt"})
+    keyreq = next(b for _, b in r.outbound if framing.parse(b).verb == "KEYREQ")
+    net.clock.t += wait
+    bot.tick()
+    for _, body in eve.receive("bot", keyreq).outbound:     # eve answers from "vjt"
+        bot.receive("vjt", body)
+    r = bot.send("eve", {"t": "text", "body": "for eve"})
+    assert [e for e in r.events if isinstance(e, SendQueued)]   # no session for eve
 
 
 def test_a_challenge_that_cannot_be_built_is_not_a_lost_message(net):
