@@ -386,8 +386,9 @@ class Engine:
     def _live_queue(self, key: str, res: Result) -> list[_Queued]:
         """The queue for a folded nick, minus what waited too long (reported,
         a CHAL excepted: see _lost). A CHAL past its deadline stays until
-        then, never sent (_encrypt): when the keys come back, it is what says
-        they are the keys of the key it was queued for (_on_keys)."""
+        OUTQ_TTL like the rest, never sent (_encrypt): when the keys come
+        back, it is what says they are the keys of the key it was queued for
+        (_on_keys)."""
         q = self._outq.pop(key, [])
         cutoff = self._now() - OUTQ_TTL
         live = [x for x in q if x.at > cutoff]

@@ -71,10 +71,12 @@ engine = Engine("azzurra.state.json", store.load_key("azzurra.key"),
                 network="azzurra", nick="vjt-claude", ident="claude",
                 pins=load_pins("/etc/vjt-claude/e2e.pins"))
 lag = FakeLag()      # the server's flood bank for this connection
+written = set()      # msgids of the messages your application wrote (bound it)
 
 def lost(nick, msgid, reason):   # on the pacer's thread, see below
     engine.discard([msgid])
-    if reason == "send-failed":
+    if msgid in written:         # a CHAL ends in the challenge book, a KEYREQ,
+        written.discard(msgid)   # KEYS or NACK is the protocol's to recover
         report_lost(nick)
 
 # The pacer charges the lines it releases: write them, do not charge them again.
@@ -90,9 +92,12 @@ def dispatch(result):
     # dispatch its Result under one lock when several threads use it.
     refused = pacer.submit_all(result.outbound, result.urgent)
     engine.discard([msgid for _, msgid in refused])
-    for nick, msgid in refused:
-        if msgid not in result.urgent:   # a refused CHAL ends as ChallengeExpired
-            report_lost(nick)            # the pacer's queue for it was full
+    for nick, msgid in refused:          # Olm messages only
+        if result.urgent.get(msgid) is None:   # not a CHAL (it has a deadline):
+            report_lost(nick)                  # the pacer's queue for it was full
+    for f in map(framing.parse, (body for _, body in result.outbound)):
+        if f.verb in ("MSG", "PKMSG") and result.urgent.get(f.msgid) is None:
+            written.add(f.msgid)         # text, or an ACK
     for event in result.events:
         handle(event)                    # Received, KeyAlarm, AckOk, ...
 
@@ -122,9 +127,9 @@ Every failure the engine can see is a `SendFailed` event with a reason
 `key-mismatch`, `rekey-throttled`, `resend-failed`, `repinned`,
 `nack-from-another-nick`, ...) and the number of messages lost; `send()` never
 raises. A CHAL is never counted in one, since it is no message your
-application wrote: when it cannot go (no keys within its 15 s, a full queue, a
-NACK it cannot be re-sent after, a challenge too long or unencodable), its
-order ends in the engine's challenge book, as `ChallengeExpired` unless an ACK
+application wrote: when it cannot go (no keys within its 15 s, keys from a key
+other than the one it was queued for, a full queue, a NACK it cannot be re-sent
+after, a challenge too long or unencodable), its order ends in the engine's challenge book, as `ChallengeExpired` unless an ACK
 still comes back (a NACK from another nick does not mean the CHAL never
 arrived). `challenge()` raises `NotPinnedError` for a nick without
 a pinned key: ask `pinned()` first, under the same lock. IRC itself has no delivery receipt.
@@ -138,8 +143,9 @@ engine reports what it cost (a `keys-timeout`). What the pacer loses after
 queueing it goes to `on_lost(nick, msgid, reason)`: `"late"`, a CHAL it could
 no longer start in time to be answered (`ChallengeExpired` then reports the
 order), and `"send-failed"`, a message one of whose lines your `send` raised
-on (the rest of it is dropped: its receiver could never complete it). If the
-pacer's thread dies, every call on it raises from then on. A message too long
+on (the rest of it is dropped: its receiver could never complete it). Report
+either only for a message your application wrote (the example's `written`).
+If the pacer's thread dies, every call on it raises from then on. A message too long
 for 64 fragments is a `SendFailed` `too-long`, and leaves the session as it
 was. What a peer receives and cannot decrypt, it NACKs, and the
 message is sent once more. A message the global reassembly cap drops (see
