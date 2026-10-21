@@ -116,16 +116,38 @@ def test_a_challenge_that_waited_in_vain_for_keys_is_not_a_lost_message(net):
     assert [e for e in res.events if isinstance(e, ChallengeExpired)]
 
 
-def test_a_challenge_past_its_deadline_frees_its_place_in_the_queue(net):
+def test_keys_that_come_back_after_a_challenge_expired_still_open_the_session(net):
+    # The expired CHAL still waits in the queue for keys (never sent): it is
+    # what tells the keys apart from another pinned key's, so they open the
+    # session, and the reply after them goes straight out on it.
+    bot, vjt = paired(net)
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    net.clock.t += CHALLENGE_TTL + 1
+    assert [e for e in bot.tick().events if isinstance(e, ChallengeExpired)]
+    net.pump("bot", res)                            # its KEYREQ, and the KEYS, come late
+    assert net.captured("PKMSG", "bot") == []       # the CHAL is not sent
+    r = bot.send("vjt", {"t": "text", "body": "a reply"})
+    assert not [e for e in r.events if isinstance(e, SendQueued)]
+
+
+def test_a_challenge_that_cannot_be_built_is_not_a_lost_message(net):
+    bot, vjt = establish(net)
+    for channel in ("#\ud800", "#" + "x" * 40000):  # unencodable, then too long
+        _, res = bot.challenge("vjt", network="TestNet", channel=channel,
+                               sender_mask="vjt!vjt@host", line=LINE)
+        assert lost(res.events) == [] and res.outbound == []
+    net.clock.t += CHALLENGE_TTL + 1
+    assert len([e for e in bot.tick().events if isinstance(e, ChallengeExpired)]) == 2
+
+
+def test_an_ack_the_application_wrote_is_still_a_lost_message(net):
+    # An ACK is urgent like a CHAL, but has no deadline: its loss is reported.
     bot, vjt = paired(net)
     net.drop = lambda *_: True
-    for i in range(OUTQ_MAX - 1):
+    for i in range(OUTQ_MAX):
         net.pump("bot", bot.send("vjt", {"t": "text", "body": f"m{i}"}))
-    chal(net, bot)                                  # the last place
-    net.clock.t += CHALLENGE_TTL + 1
-    assert lost(bot.tick().events) == []
-    r = bot.send("vjt", {"t": "text", "body": "one more"})
-    assert lost(r.events) == [] and any(isinstance(e, SendQueued) for e in r.events)
+    assert lost(bot.send("vjt", {"t": "ack", "nonce": "n"}).events) == [("queue-full", 1)]
 
 
 def test_a_challenge_a_full_queue_refuses_is_not_a_lost_message(net):
