@@ -121,8 +121,12 @@ Every failure the engine can see is a `SendFailed` event with a reason
 (`unpinned-nick`, `unencodable`, `too-long`, `queue-full`, `keys-timeout`,
 `key-mismatch`, `rekey-throttled`, `resend-failed`, `repinned`,
 `nack-from-another-nick`, ...) and the number of messages lost; `send()` never
-raises. `challenge()` raises `NotPinnedError` for a nick without a pinned key:
-ask `pinned()` first, under the same lock. IRC itself has no delivery receipt.
+raises. A CHAL is never counted in one: when it cannot go (no keys within its
+15 s, a full queue, a NACK it cannot be re-sent after), its order ends as
+`ChallengeExpired` and nothing else, since it is no message your application
+wrote; past its deadline it leaves the queue for keys at the next `tick()`, and
+holds no place there. `challenge()` raises `NotPinnedError` for a nick without
+a pinned key: ask `pinned()` first, under the same lock. IRC itself has no delivery receipt.
 A line the server drops (no such nick, the receiver's CTCP flood limit) or that
 a broken connection eats is lost without an event, like any IRC line. A
 message the pacer refuses, its queues being full (see Pacing), comes back

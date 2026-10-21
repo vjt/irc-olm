@@ -3,7 +3,9 @@ import re
 
 import pytest
 
-from irc_olm.engine import (AckOk, AckRejected, ChallengeExpired, NotPinnedError, Received)
+from irc_olm import framing
+from irc_olm.engine import (OUTQ_MAX, OUTQ_TTL, AckOk, AckRejected, ChallengeExpired,
+                            NotPinnedError, Received, Result, SendFailed, SendQueued)
 from irc_olm.challenge import CHALLENGE_TTL
 
 
@@ -85,3 +87,118 @@ def test_ack_after_expiry_without_a_tick_is_rejected_as_expired(net):
     net.clock.t += CHALLENGE_TTL + 1
     net.pump("vjt", vjt.send("bot", {"t": "ack", "nonce": ch.nonce}))
     assert [e.reason for e in net.take("bot", AckRejected)] == ["expired"]
+
+
+# --- a challenge that cannot go is its order's expiry, never a lost message ------
+#
+# A CHAL is no message the application wrote: when it cannot go, its order ends
+# as ChallengeExpired, and a SendFailed counting it as well reports a lost
+# reply that nobody sent.
+
+def paired(net):
+    bot, vjt = net.add("bot"), net.add("vjt")
+    net.pair("bot", "vjt")
+    return bot, vjt
+
+
+def lost(events):
+    return [(e.reason, e.lost) for e in events if isinstance(e, SendFailed)]
+
+
+def test_a_challenge_that_waited_in_vain_for_keys_is_not_a_lost_message(net):
+    bot, vjt = paired(net)
+    net.drop = lambda *_: True                      # nobody answers the KEYREQ
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "a reply"}))
+    chal(net, bot)
+    net.clock.t += OUTQ_TTL + 1
+    res = bot.tick()
+    assert lost(res.events) == [("keys-timeout", 1)]   # the reply, not the CHAL
+    assert [e for e in res.events if isinstance(e, ChallengeExpired)]
+
+
+def test_a_challenge_past_its_deadline_frees_its_place_in_the_queue(net):
+    bot, vjt = paired(net)
+    net.drop = lambda *_: True
+    for i in range(OUTQ_MAX - 1):
+        net.pump("bot", bot.send("vjt", {"t": "text", "body": f"m{i}"}))
+    chal(net, bot)                                  # the last place
+    net.clock.t += CHALLENGE_TTL + 1
+    assert lost(bot.tick().events) == []
+    r = bot.send("vjt", {"t": "text", "body": "one more"})
+    assert lost(r.events) == [] and any(isinstance(e, SendQueued) for e in r.events)
+
+
+def test_a_challenge_a_full_queue_refuses_is_not_a_lost_message(net):
+    bot, vjt = paired(net)
+    net.drop = lambda *_: True
+    for i in range(OUTQ_MAX):
+        net.pump("bot", bot.send("vjt", {"t": "text", "body": f"m{i}"}))
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    assert lost(res.events) == []
+    net.clock.t += CHALLENGE_TTL + 1
+    assert [e for e in bot.tick().events if isinstance(e, ChallengeExpired)]
+
+
+def test_a_challenge_queued_for_a_replaced_key_is_not_a_lost_message(net):
+    bot = net.add("bot")
+    k1, k2 = net.add("k1"), net.add("k2")
+    net.pins["bot"]["k"] = k1.fingerprint
+    bot.set_pins(net.pins["bot"])
+    net.pin("k2", "bot")
+    r1 = bot.send("k", {"t": "text", "body": "for k1"})       # KEYREQ, queued for k1
+    bot.challenge("k", network="TestNet", channel="#sbiffo", sender_mask="k!k@host", line=LINE)
+    net.pins["bot"]["k"] = k2.fingerprint
+    bot.set_pins(net.pins["bot"])
+    res = Result()
+    for _, body in k2.receive("bot", r1.outbound[0][1]).outbound:   # k2 is on "k" now
+        res.extend(bot.receive("k", body))
+    assert lost(res.events) == [("key-mismatch", 1)]
+
+
+@pytest.mark.parametrize("nacker, reason", [("eve", "nack-from-another-nick"),
+                                            ("vjt", "repinned"), ("vjt", "unpinned-key")])
+def test_a_challenge_a_nack_cannot_resend_is_not_a_lost_message(net, nacker, reason):
+    bot, vjt = establish(net)
+    net.add("eve")
+    net.pair("bot", "eve")
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    ref = framing.parse(res.outbound[0][1]).msgid
+    text_ref = framing.parse(bot.send("vjt", {"t": "text", "body": "x"}).outbound[0][1]).msgid
+    if reason == "repinned":
+        net.pins["bot"]["vjt"] = net.engines["eve"].fingerprint
+        net.pins["bot"]["vjtold"] = vjt.fingerprint
+        bot.set_pins(net.pins["bot"])
+    elif reason == "unpinned-key":
+        del net.pins["bot"]["vjt"]
+        bot.set_pins(net.pins["bot"])
+    assert lost(net.inject(nacker, "bot", "NACK", {"v": 1, "ref": ref}).events) == []
+    # the same NACK for a message a sender wrote is still its loss
+    assert lost(net.inject(nacker, "bot", "NACK", {"v": 1, "ref": text_ref}).events) == \
+        [(reason, 1)]
+
+
+def test_a_challenge_a_nack_cannot_rekey_for_is_not_a_lost_message(net):
+    bot, vjt = paired(net)
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))   # the bot opened it
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    ref = framing.parse(res.outbound[0][1]).msgid
+    text_ref = framing.parse(bot.send("vjt", {"t": "text", "body": "x"}).outbound[0][1]).msgid
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref}).events) == []
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": text_ref}).events) == \
+        [("rekey-throttled", 1)]
+
+
+def test_a_challenge_nacked_after_its_resend_is_not_a_lost_message(net):
+    bot, vjt = establish(net)
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    ref = framing.parse(res.outbound[0][1]).msgid
+    before = len(net.wire)
+    net.pump("bot", net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref}))   # re-key, re-send
+    (resent,) = {framing.parse(b).msgid for s, _, b in net.wire[before:]
+                 if s == "bot" and framing.parse(b).verb in ("PKMSG", "MSG")}
+    assert [e.inner["t"] for e in net.take("vjt", Received)] == ["chal"]
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": resent}).events) == []
