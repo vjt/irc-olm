@@ -375,7 +375,7 @@ class Engine:
         key = fold(nick)
         q = self._live_queue(key, res)
         if len(q) >= OUTQ_MAX:
-            res.events.append(SendFailed(nick, "queue-full", 1))
+            self._lost(nick, "queue-full", [msg], res)
             return
         q.append(_Queued(nick, peer.ed25519, msg, self._now()))
         self._outq[key] = q
@@ -383,14 +383,27 @@ class Engine:
         self._maybe_keyreq(nick, peer, res)
 
     def _live_queue(self, key: str, res: Result) -> list[_Queued]:
-        """The queue for a folded nick, minus what waited too long (reported)."""
-        q = self._outq.pop(key, [])
-        live = [x for x in q if x.at > self._now() - OUTQ_TTL]
+        """The queue for a folded nick, minus what waited too long (reported).
+        A CHAL past its deadline leaves first, unreported (_lost): it frees its
+        place, and it can never wait long enough to count as a keys-timeout."""
+        now = self._now()
+        q = [x for x in self._outq.pop(key, []) if x.msg.expires is None or x.msg.expires > now]
+        live = [x for x in q if x.at > now - OUTQ_TTL]
         if len(live) < len(q):
             res.events.append(SendFailed(q[0].nick, "keys-timeout", len(q) - len(live)))
         if live:
             self._outq[key] = live
         return live
+
+    @staticmethod
+    def _lost(nick: str, reason: str, msgs: list[_Outgoing], res: Result) -> None:
+        """SendFailed for the messages in `msgs` the application wrote. A CHAL
+        is not one of them: when it cannot go, its order ends as
+        ChallengeExpired, and counting it here would report a lost reply
+        nobody sent."""
+        n = sum(1 for m in msgs if m.expires is None)
+        if n:
+            res.events.append(SendFailed(nick, reason, n))
 
     def _maybe_keyreq(self, nick: str, peer: Peer, res: Result) -> None:
         key = fold(nick)
@@ -535,8 +548,8 @@ class Engine:
         # Each queued message goes to the key it was meant for, or nowhere:
         # the nick may have been re-pinned since it was queued.
         mine = [q for q in queue if peer is not None and q.ed25519 == peer.ed25519]
-        if len(mine) < len(queue):
-            res.events.append(SendFailed(nick, "key-mismatch", len(queue) - len(mine)))
+        self._lost(nick, "key-mismatch",
+                   [q.msg for q in queue if peer is None or q.ed25519 != peer.ed25519], res)
         if not mine:
             return
         self._bind(peer, proven=False)
@@ -641,16 +654,16 @@ class Engine:
         if fold(sent.nick) != fold(nick):
             # NACKs are not authenticated: never re-send on the word of a
             # nick we did not send to. The recipient renamed, most likely.
-            res.events.append(SendFailed(sent.nick, "nack-from-another-nick", 1))
+            self._lost(sent.nick, "nack-from-another-nick", [sent.msg], res)
             return
         if peer is None:
-            res.events.append(SendFailed(nick, "unpinned-key", 1))
+            self._lost(nick, "unpinned-key", [sent.msg], res)
             return
         if not self._reached_at(nick, peer):
-            res.events.append(SendFailed(nick, "repinned", 1))
+            self._lost(nick, "repinned", [sent.msg], res)
             return
         if sent.msg.sends >= MAX_SENDS:
-            res.events.append(SendFailed(nick, "resend-failed", 1))
+            self._lost(nick, "resend-failed", [sent.msg], res)
             return
         lst = self._sessions.get(peer.curve25519) or []
         if lst and lst[0].session_id != sent.session_id or fold(nick) in self._keyreq_at:
@@ -663,7 +676,7 @@ class Engine:
         # spec allows one per peer per minute.
         last = self._rekey_at.get(peer.ed25519)
         if last is not None and self._now() - last < REKEY_INTERVAL:
-            res.events.append(SendFailed(nick, "rekey-throttled", 1))
+            self._lost(nick, "rekey-throttled", [sent.msg], res)
             return
         self._drop_session(peer.curve25519, sent.session_id)
         res.events.append(Rekeying(nick, peer))
