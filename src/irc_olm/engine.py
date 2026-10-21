@@ -357,7 +357,8 @@ class Engine:
                 # in a queue flush or a re-send least of all.
                 plaintext = encode_inner(inner)
             except (TypeError, ValueError):
-                res.events.append(SendFailed(nick, "unencodable", 1))
+                if expires is None:     # a CHAL's order ends in the book (_lost)
+                    res.events.append(SendFailed(nick, "unencodable", 1))
                 return res
             urgent = isinstance(inner, dict) and inner.get("t") in URGENT_INNER
             self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1, expires), res)
@@ -383,14 +384,15 @@ class Engine:
         self._maybe_keyreq(nick, peer, res)
 
     def _live_queue(self, key: str, res: Result) -> list[_Queued]:
-        """The queue for a folded nick, minus what waited too long (reported).
-        A CHAL past its deadline leaves first, unreported (_lost): it frees its
-        place, and it can never wait long enough to count as a keys-timeout."""
-        now = self._now()
-        q = [x for x in self._outq.pop(key, []) if x.msg.expires is None or x.msg.expires > now]
-        live = [x for x in q if x.at > now - OUTQ_TTL]
+        """The queue for a folded nick, minus what waited too long (reported,
+        a CHAL excepted: see _lost). A CHAL past its deadline stays until
+        then, never sent (_encrypt): when the keys come back, it is what says
+        they are the keys of the key it was queued for (_on_keys)."""
+        q = self._outq.pop(key, [])
+        cutoff = self._now() - OUTQ_TTL
+        live = [x for x in q if x.at > cutoff]
         if len(live) < len(q):
-            res.events.append(SendFailed(q[0].nick, "keys-timeout", len(q) - len(live)))
+            self._lost(q[0].nick, "keys-timeout", [x.msg for x in q if x.at <= cutoff], res)
         if live:
             self._outq[key] = live
         return live
@@ -398,9 +400,9 @@ class Engine:
     @staticmethod
     def _lost(nick: str, reason: str, msgs: list[_Outgoing], res: Result) -> None:
         """SendFailed for the messages in `msgs` the application wrote. A CHAL
-        is not one of them: when it cannot go, its order ends as
-        ChallengeExpired, and counting it here would report a lost reply
-        nobody sent."""
+        is not one of them: when it cannot go, its order ends in the
+        challenge book (ChallengeExpired, unless an ACK still comes), and
+        counting it here would report a lost reply nobody sent."""
         n = sum(1 for m in msgs if m.expires is None)
         if n:
             res.events.append(SendFailed(nick, reason, n))
@@ -433,7 +435,7 @@ class Engine:
             # forgets the oldest, and the messages still on their way with
             # them). Nothing was saved, and nothing leaves.
             sessions[0] = vz.Session.from_pickle(before, self._key)
-            res.events.append(SendFailed(nick, "too-long", 1))
+            self._lost(nick, "too-long", [msg], res)
             return
         self._save()        # before any of it leaves: the caller sends it
         self._sent[msgid] = _Sent(nick, peer.ed25519, sessions[0].session_id, msg, self._now())
