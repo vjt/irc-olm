@@ -75,7 +75,7 @@ written = set()      # msgids of the messages your application wrote (bound it)
 
 def lost(nick, msgid, reason):   # on the pacer's thread, see below
     engine.discard([msgid])
-    if msgid in written:         # a CHAL ends in the challenge book, a KEYREQ,
+    if msgid in written:         # a CHAL ends in the challenge book; a KEYREQ,
         written.discard(msgid)   # KEYS or NACK is the protocol's to recover
         report_lost(nick)
 
@@ -90,14 +90,15 @@ def send_raw(line):  # every OTHER line: registration, PONG, chat
 def dispatch(result):
     # Lines leave in the order the engine produced them: call the engine and
     # dispatch its Result under one lock when several threads use it.
-    refused = pacer.submit_all(result.outbound, result.urgent)
-    engine.discard([msgid for _, msgid in refused])
-    for nick, msgid in refused:          # Olm messages only
-        if result.urgent.get(msgid) is None:   # not a CHAL (it has a deadline):
-            report_lost(nick)                  # the pacer's queue for it was full
     for f in map(framing.parse, (body for _, body in result.outbound)):
         if f.verb in ("MSG", "PKMSG") and result.urgent.get(f.msgid) is None:
-            written.add(f.msgid)         # text, or an ACK
+            written.add(f.msgid)         # text, or an ACK (a CHAL has a deadline)
+    refused = pacer.submit_all(result.outbound, result.urgent)   # lost() may run now
+    engine.discard([msgid for _, msgid in refused])
+    for nick, msgid in refused:          # Olm messages only, a CHAL among them
+        if msgid in written:             # the pacer's queue for it was full
+            written.discard(msgid)
+            report_lost(nick)
     for event in result.events:
         handle(event)                    # Received, KeyAlarm, AckOk, ...
 
@@ -137,17 +138,18 @@ A line the server drops (no such nick, the receiver's CTCP flood limit) or that
 a broken connection eats is lost without an event, like any IRC line. A
 message the pacer refuses, its queues being full (see Pacing), comes back
 from `submit_all` as `(nick, msgid)`: report it, and hand the msgids to
-`engine.discard()`. Only messages that carried text come back: a refused
+`engine.discard()`. Only Olm messages (MSG, PKMSG) come back: a refused
 KEYREQ, KEYS or NACK is logged, and the protocol recovers from it or the
 engine reports what it cost (a `keys-timeout`). What the pacer loses after
 queueing it goes to `on_lost(nick, msgid, reason)`: `"late"`, a CHAL it could
 no longer start in time to be answered (`ChallengeExpired` then reports the
 order), and `"send-failed"`, a message one of whose lines your `send` raised
-on (the rest of it is dropped: its receiver could never complete it). Report
-either only for a message your application wrote (the example's `written`).
-If the pacer's thread dies, every call on it raises from then on. A message too long
-for 64 fragments is a `SendFailed` `too-long`, and leaves the session as it
-was. What a peer receives and cannot decrypt, it NACKs, and the
+on (the rest of it is dropped: its receiver could never complete it). Report a
+loss only for a message your application wrote, text or an ACK (the example's
+`written`): a `"late"` one is always a CHAL, and a KEYREQ, KEYS or NACK is
+handled as when the pacer refuses one. If the pacer's thread dies, every call
+on it raises from then on. A message too long for 64 fragments is a
+`SendFailed` `too-long`, and leaves the session as it was. What a peer receives and cannot decrypt, it NACKs, and the
 message is sent once more. A message the global reassembly cap drops (see
 Pacing) is a `Dropped` event with reason `reassembly:global-byte-cap` and the
 case-folded nick it came from.
