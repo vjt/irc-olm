@@ -19,7 +19,6 @@ trust-on-first-use here; SAS is for humans, in cicchetto.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import threading
@@ -34,6 +33,7 @@ import vodozemac as vz
 from . import framing
 from .challenge import Challenge, ChallengeBook, new_challenge
 from .framing import PayloadError, fold
+from .keys import b64u, ed25519_key, sig_ok, unb64u
 from .reassembly import Assembled, Reassembler, Rejected
 from .store import StateFile
 
@@ -73,23 +73,6 @@ class StateMismatchError(ValueError):
 
 class NotPinnedError(ValueError):
     """An operation that needs a pinned key, for a nick without one."""
-
-
-def b64u(data: bytes) -> str:
-    return base64.b64encode(data).decode().rstrip("=")
-
-
-def unb64u(text: str) -> bytes:
-    return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
-
-
-def ed25519_key(key: str) -> vz.Ed25519PublicKey:
-    """An Ed25519 key from base64. Raises ValueError on a malformed one.
-    vodozemac 0.10 PANICS on a key of 33 bytes, and pyo3 raises that as a
-    PanicException, a BaseException: it never sees anything but 32."""
-    if len(unb64u(key)) != 32:
-        raise ValueError("an Ed25519 key is 32 bytes")
-    return vz.Ed25519PublicKey.from_base64(key)
 
 
 def canonical_ed25519(key: str) -> str:
@@ -535,7 +518,7 @@ class Engine:
             res.events.append(Dropped(nick, "unsolicited-keys", "KEYS"))
             return
         otk = payload["otk"]
-        if not self._sig_ok(payload["id"]["ed25519"], OTK_SIG_PREFIX + otk["key"], otk["sig"]):
+        if not sig_ok(payload["id"]["ed25519"], OTK_SIG_PREFIX + otk["key"], otk["sig"]):
             res.events.append(Dropped(nick, "bad-otk-signature", "KEYS"))
             return
         peer = self._identify(nick, payload["id"], res, proving=False)
@@ -758,7 +741,7 @@ class Engine:
         one-time key and relay). Only a pre-key message the curve's holder
         built to us does: `proving` may take the curve from a key that only
         claimed it."""
-        if not self._sig_ok(ident["ed25519"], ID_SIG_PREFIX + ident["curve25519"], ident["sig"]):
+        if not sig_ok(ident["ed25519"], ID_SIG_PREFIX + ident["curve25519"], ident["sig"]):
             res.events.append(Dropped(nick, "bad-identity-signature"))
             return None
         ed = canonical_ed25519(ident["ed25519"])
@@ -819,15 +802,6 @@ class Engine:
 
     def _sign(self, text: str) -> str:
         return self._account.sign(text.encode()).to_base64()
-
-    @staticmethod
-    def _sig_ok(ed25519: str, text: str, sig: str) -> bool:
-        try:
-            ed25519_key(ed25519).verify_signature(
-                text.encode(), vz.Ed25519Signature.from_base64(sig))
-        except (vz.KeyException, vz.SignatureException, vz.DecodeException, ValueError):
-            return False
-        return True
 
     def _new_fallback_key(self) -> None:
         self._account.generate_fallback_key()
