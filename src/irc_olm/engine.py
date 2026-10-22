@@ -476,11 +476,10 @@ class Engine:
         self._maybe_keyreq(nick, res)
 
     def _live_queue(self, key: str, res: Result) -> list[_Queued]:
-        """The queue for a folded nick, minus what waited too long (reported
-        when it reached no device, a CHAL excepted: see _lost). A CHAL past
-        its deadline stays until OUTQ_TTL like the rest, never sent
-        (_encrypt): when the keys come back, it is what says they are the
-        keys of the master it was queued for (_on_keys)."""
+        """The queue for a folded nick, minus what waited too long, reported
+        when it reached no device. Only what the application wrote waits
+        here (_Outgoing.written): never a CHAL, which goes only on a session
+        its device wrote to (O1), nor a listreq or a t:list."""
         q = self._outq.pop(key, [])
         cutoff = self._now() - OUTQ_TTL
         live = [x for x in q if x.at > cutoff]
