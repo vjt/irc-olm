@@ -55,7 +55,9 @@ KEYS_INTERVAL = KEYREQ_RETRY / 2  # at most one KEYS answer per nick in this lon
                              # (two lines, 8 s of our flood bank). Half the retry:
                              # it runs from the KEYREQ's arrival here, the retry
                              # from its sending there, after a wait in a pacer
-OUTQ_TTL = 60.0              # queued plaintext waiting for keys
+OUTQ_TTL = 90.0              # queued plaintext waiting for keys: a re-key's KEYREQ
+                             # may wait out the budget (30 s), and its KEYS then take
+                             # as long as 38 s for four devices (amendment O2(c))
 OUTQ_MAX = 16
 REKEY_INTERVAL = 60.0        # spec: at most one re-key per nick per minute
 OTK_PER_NICK_INTERVAL = 60.0 # one one-time key per nick per minute, else the fallback

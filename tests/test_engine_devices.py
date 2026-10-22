@@ -512,3 +512,26 @@ def test_a_keyreq_whose_keys_never_came_is_no_rekey_to_join_past_the_retry(net):
     late = net.inject("alice.1", "bot", "NACK", {"v": 2, "ref": ref})
     assert [e.reason for e in late.events if isinstance(e, SendFailed)] == ["rekey-throttled"]
     assert late.outbound == []
+
+
+def test_a_resend_outlives_its_rekeys_wait_and_a_slow_keys(net):
+    # The KEYREQ budget (30 s) and a three-device KEYS (its last line about
+    # 32 s after its first, amendment O2(c)) back to back: the re-sent copy
+    # is still queued when the keys land.
+    from irc_olm.engine import KEYREQ_RETRY, Result
+    bot, (a0, a1, a2), nacks = nacked_inside_the_budget(net)
+    net.no_keys = set()
+    net.clock.t += 1
+    bot.receive("alice", nacks[0])                # a re-key, its KEYREQ due in 29 s
+    net.clock.t += KEYREQ_RETRY - 1
+    (keyreq,) = [b for _, b in bot.tick().outbound]
+    lines = [b for _, b in net._grappa_keys("alice", "bot", keyreq).outbound]
+    out, start = Result(), net.clock.t
+    for i, line in enumerate(lines):
+        while net.clock.t < start + 32 * i / (len(lines) - 1):
+            net.clock.t += 1
+            out.extend(bot.tick())
+        out.extend(bot.receive("alice", line))
+    net.pump("bot", out)
+    assert texts(net.take("alice.0"))[-1:] == ["two"]
+    assert [e for e in out.events if isinstance(e, SendFailed)] == []

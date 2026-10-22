@@ -128,7 +128,7 @@ BUDGET_WINDOW = 60.0
 # reserve ahead of them all, and pays for the rest of it, once, from URGENT's
 # allowance: one first contact a minute while the orders are at their budget.
 # Its asker asks again at KEYREQ_RETRY (30 s) and drops what it queued at
-# OUTQ_TTL (60 s). A NACK has no asker waiting (its sender keeps the message
+# OUTQ_TTL (90 s for a bot). A NACK has no asker waiting (its sender keeps the message
 # SENT_MEMORY) and never goes ahead of the orders.
 FRESH_PATIENCE = 8.0
 # Text queued and no text line released for this long: a text message under

@@ -375,7 +375,7 @@ shape named, not beyond it):
   (24.7 with two text streams and 1-4 humans every 6-15 s), and an honest
   peer's KEYS leaves within 32 s (over 22 s in 55 of 144 random shapes,
   past the asker's 30 s in 3, which then asks again and keeps what it
-  queued for 60 s); another human's order leaves within 7 s, or within
+  queued for 90 s if it is a bot); another human's order leaves within 7 s, or within
   13 s when it lands just behind the chatting human's challenge (two
   challenges at a 10 s bank). The second human and a first contact share
   the allowance: with one human addressing the bot every 15 s and a first
