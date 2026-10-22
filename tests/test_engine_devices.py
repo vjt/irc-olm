@@ -48,13 +48,19 @@ def test_a_first_message_to_two_devices_is_one_pkmsg_with_a_body_each(net):
     net.pump("bot", bot.send("alice", text("ciao")))
     assert texts(net.take("alice.0")) == ["ciao"] and texts(net.take("alice.1")) == ["ciao"]
     msgs = sent(net, "bot")
-    assert [(v, to) for v, to, _ in msgs] == [("KEYREQ", "*"), ("PKMSG", "*")]
+    assert [(v, to) for v, to, _ in msgs[:2]] == [("KEYREQ", "*"), ("PKMSG", "*")]
     assert set(msgs[1][2]["bodies"]) == {a0.did, a1.did}
-    assert [(v, to) for v, to, _ in sent(net, "alice")] == [("KEYS", bot.did)]
+    # Each device then asks for the bot's list (our `lv` is news to it), and
+    # gets it, on its own session: MSGs, one body each.
+    assert sorted((v, to) for v, to, _ in msgs[2:]) == sorted([("MSG", a0.did), ("MSG", a1.did)])
+    assert [(v, to) for v, to, _ in sent(net, "alice")][0] == ("KEYS", bot.did)
 
 
 def test_msg_and_pkmsg_bodies_never_share_a_message_and_the_last_heard_goes_first(net):
     bot, (a0, a1) = setup(net)
+    a1_did = a1.did
+    # a1 never writes back (its listreq is lost): its session stays a PKMSG one.
+    net.drop = lambda src, dst, body: src == "alice" and framing.parse(body).src == a1_did
     net.pump("bot", bot.send("alice", text("ciao")))
     net.pump("alice.0", a0.send("bot", text("from my phone")))     # a MSG: a0's session answered
     assert texts(net.take("bot")) == ["from my phone"]
@@ -77,7 +83,7 @@ def test_a_device_dropped_from_a_newer_list_is_revoked_for_good(net):
     net.pump("bot", bot.send("alice", text("v2")))
     assert texts(net.take("alice.0"))[-1] == "v2" and texts(net.take("alice.2")) == ["v2"]
     assert texts(net.take("alice.1")) == []
-    assert [d.ed25519 for d in bot.devices(a0.fingerprint)] == sorted([a0.device_key, a2.device_key])
+    assert sorted(d.ed25519 for d in bot.devices(a0.fingerprint)) == sorted([a0.device_key, a2.device_key])
 
     def from_a1(bot):
         # The stolen device still holds a session, and its certificate.
@@ -129,7 +135,7 @@ def test_a_nack_from_one_device_resends_to_that_device_alone(net):
     assert texts(net.take("alice.1")) == ["two"]          # after the re-key
     assert [e.device for e in net.take("bot") if isinstance(e, Rekeying)] == [a1.device_key]
     assert [(v, to, set(p.get("bodies", ()))) for v, to, p in sent(net, "bot")[n:]] == [
-        ("PKMSG", "*", {a0.did, a1.did}), ("KEYREQ", "*", set()), ("PKMSG", a1.did, {a1.did})]
+        ("MSG", "*", {a0.did, a1.did}), ("KEYREQ", "*", set()), ("PKMSG", a1.did, {a1.did})]
 
 
 def test_a_nack_from_a_device_the_message_never_went_to_is_ignored(net):

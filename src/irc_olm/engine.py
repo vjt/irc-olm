@@ -38,7 +38,8 @@ import vodozemac as vz
 from . import framing
 from .challenge import Challenge, ChallengeBook, new_challenge
 from .devices import (MAX_DEVICES, Book, Device, InvalidBlock, binding, did, id_block,
-                      parse_keys, parse_master_ref, sign_cert, sign_master, wire_int)
+                      parse_keys, parse_master, parse_master_ref, sign_cert, sign_master,
+                      wire_int)
 from .framing import PayloadError, fold
 from .keys import b64, ed25519_key, is_key, sig_ok, unb64
 from .reassembly import Assembled, Reassembler, Rejected
@@ -67,6 +68,7 @@ SENT_MAX = 1200              # and at most this many: what the bank lets out in
 MAX_SENDS = 2                # a message goes out at most twice to a device: once,
                              # and once more on a fresh session after a NACK
 URGENT_INNER = ("chal", "ack")  # inner types that may go ahead of text
+LISTREQ_INTERVAL = 60.0      # a listreq per nick, and an answer per (nick, device), a minute
 PROTOCOL_INNER = ("lv", "fb")   # inner fields the engine writes and reads itself
 MAX_SESSIONS_PER_PEER = 5
 SEEN_SESSIONS_MAX = 10_000
@@ -203,11 +205,15 @@ class Result:
     # is left of its 15 s: the pacer starts it only while an ACK can still
     # make it back in time.
     urgent: dict[str, float | None] = field(default_factory=dict)
+    # The msgids of the Olm messages a peer drew from us, the REACTIVE lane's
+    # as KEYS and NACK are: a `listreq` and the `t:list` answering one.
+    reactive: set[str] = field(default_factory=set)
 
     def extend(self, other: "Result") -> "Result":
         self.events.extend(other.events)
         self.outbound.extend(other.outbound)
         self.urgent |= other.urgent
+        self.reactive |= other.reactive
         return self
 
 
@@ -219,6 +225,16 @@ class _Outgoing:
     urgent: bool     # a CHAL or an ACK: ahead of text in the pacer
     sends: int       # 1 for a first send, 2 for a re-send after a NACK
     expires: float | None   # a CHAL's expires_at: useless, and not sent, after it
+    reactive: bool   # a listreq or a t:list: the engine's own, on the REACTIVE lane
+
+    @property
+    def written(self) -> bool:
+        """A message the application wrote: text or an ACK, whose loss is
+        reported (SendFailed), and which waits in the queue for keys. A CHAL
+        never does: it goes only on a session its device has written to (O1),
+        and when it cannot go its order ends in the challenge book. Neither
+        does a listreq or a t:list, which the next decrypt asks again."""
+        return self.expires is None and not self.reactive
 
 
 @dataclass
@@ -270,6 +286,9 @@ class Engine:
         self._keys_at: dict[str, float] = {}         # folded nick -> last KEYS answer
         self._rekey_at: dict[str, float] = {}        # folded nick -> last session opened
         self._rekeying: set[str] = set()             # device keys waiting for fresh keys
+        self._listreq_at: dict[str, float] = {}      # folded nick -> last listreq sent
+        self._listreq_lv: dict[str, int] = {}        # folded nick -> highest lv asked for
+        self._listed_at: dict[tuple[str, str], float] = {}  # (nick, device) -> list sent
         self._otk_at: dict[str, float] = {}          # folded nick -> last OTK handed out
         self._otk_log: list[float] = []
         self._sent: OrderedDict[str, _Sent] = OrderedDict()   # msgid -> its bodies
@@ -406,7 +425,7 @@ class Engine:
                     res.events.append(SendFailed(nick, "unencodable", 1))
                 return res
             urgent = inner.get("t") in URGENT_INNER
-            self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1, expires), res)
+            self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1, expires, False), res)
             return res
 
     def _send_to(self, nick: str, peer: Peer, msg: _Outgoing, res: Result, *,
@@ -419,7 +438,7 @@ class Engine:
         ready, lacking = self._split(book, want, done)
         if ready:
             done = done | self._encrypt(nick, peer, msg, ready, res)
-        if lacking or (want is None and (book is None or book.ver == 0)):
+        if msg.written and (lacking or (want is None and (book is None or book.ver == 0))):
             self._enqueue(nick, peer, msg, res, want=want, done=done)
 
     def _split(self, book: Book | None, want: frozenset[str] | None,
@@ -473,11 +492,12 @@ class Engine:
 
     @staticmethod
     def _lost(nick: str, reason: str, msgs: list[_Outgoing], res: Result) -> None:
-        """SendFailed for the messages in `msgs` the application wrote. A CHAL
-        is not one of them: when it cannot go, its order ends in the
-        challenge book (ChallengeExpired, unless an ACK still comes), and
-        counting it here would report a lost reply nobody sent."""
-        n = sum(1 for m in msgs if m.expires is None)
+        """SendFailed for the messages in `msgs` the application wrote
+        (_Outgoing.written). A CHAL is not one of them: when it cannot go, its
+        order ends in the challenge book (ChallengeExpired, unless an ACK
+        still comes), and counting it here would report a lost reply nobody
+        sent."""
+        n = sum(1 for m in msgs if m.written)
         if n:
             res.events.append(SendFailed(nick, reason, n))
 
@@ -506,6 +526,12 @@ class Engine:
             sessions = self._sessions[d.curve25519]
             before = sessions[0].pickle(self._key)
             mtype, ct = sessions[0].encrypt(msg.plaintext).to_parts()
+            if mtype == 0 and msg.expires is not None:
+                # A CHAL is never a pre-key message (O1): only a device that
+                # has written to this session gets one, so a device we never
+                # heard from cannot answer for an order it did not give.
+                sessions[0] = vz.Session.from_pickle(before, self._key)
+                continue
             if mtype == 0:
                 # A pre-key body binds both device keys (`fb`), and which kind
                 # a session writes shows only once it has: write it again,
@@ -551,6 +577,8 @@ class Engine:
                                     "bodies": wire}
         to = next(iter(wire)) if len(wire) == 1 else framing.ANY
         msgid = self._emit(nick, verb, payload, res, to=to, urgent=msg.urgent, ttl=ttl)
+        if msg.reactive:
+            res.reactive.add(msgid)
         self._sent[msgid] = _Sent(nick, peer.master, msg, self._now(), {
             addr: (d.ed25519, self._sessions[d.curve25519][0].session_id)
             for addr, (d, _, _) in bodies.items()})
@@ -878,7 +906,6 @@ class Engine:
             res.events.append(Dropped(nick, "inner-without-type"))
             return None
         fb = inner.pop("fb", None)
-        inner.pop("lv", None)
         if sender is not None and fb != binding(sender, self._device_key):
             res.events.append(Dropped(nick, "inner-key-mismatch"))
             return None
@@ -886,10 +913,65 @@ class Engine:
 
     def _deliver(self, nick: str, peer: Peer, d: Device, inner: dict, res: Result) -> None:
         peer = self._peers[peer.master]
+        lv = wire_int(inner.pop("lv", None))
         if inner["t"] == "ack":
             self._on_ack(nick, peer, inner, res)
+        elif inner["t"] == "list":
+            self._on_list(nick, peer, inner, res)
+        elif inner["t"] == "listreq":
+            self._on_listreq(nick, peer, d, res)
         else:
             res.events.append(Received(nick, peer, d.ed25519, inner))
+        if lv is not None and lv > self._books[peer.master].ver:
+            self._maybe_listreq(nick, peer, d, lv, res)
+
+    # --- device lists inside Olm ---------------------------------------------
+
+    def _on_list(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
+        """A `t:list` from one of the peer's devices: the KEYS steps 3 to 5,
+        so another master is the alarm here too."""
+        try:
+            lst = parse_master(inner.get("master"))
+        except InvalidBlock:
+            res.events.append(Dropped(nick, "invalid-list"))
+            return
+        if lst.master != peer.master:
+            res.events.append(KeyAlarm(nick, peer.master, lst.master))
+            res.events.append(Dropped(nick, "wrong-master"))
+            return
+        book = self._books[peer.master]
+        self._revoke(book, book.apply(lst)[1])
+        self._save()
+
+    def _on_listreq(self, nick: str, peer: Peer, d: Device, res: Result) -> None:
+        """Our list, to the device that asked: once per (nick, device) a
+        minute, any other ask in that minute dropped."""
+        now, ask = self._now(), (fold(nick), d.ed25519)
+        self._listed_at = {k: t for k, t in self._listed_at.items()
+                           if now - t < LISTREQ_INTERVAL}
+        if ask in self._listed_at:
+            res.events.append(Dropped(nick, "listreq-rate-limited"))
+            return
+        self._listed_at[ask] = now
+        self._send_reactive(nick, peer, d, {"t": "list", "master": self._own_block}, res)
+
+    def _maybe_listreq(self, nick: str, peer: Peer, d: Device, lv: int, res: Result) -> None:
+        """The device holds a newer list than ours (its `lv`): ask it, once
+        per (nick, lv) and once per nick a minute."""
+        key, now = fold(nick), self._now()
+        last = self._listreq_at.get(key)
+        if lv <= self._listreq_lv.get(key, 0) or (
+                last is not None and now - last < LISTREQ_INTERVAL):
+            return
+        self._listreq_lv[key], self._listreq_at[key] = lv, now
+        self._send_reactive(nick, peer, d, {"t": "listreq"}, res)
+
+    def _send_reactive(self, nick: str, peer: Peer, d: Device, inner: dict,
+                       res: Result) -> None:
+        """An inner message of the engine's own to one device, on the
+        REACTIVE lane: sent if that device is ready for it, else not at all."""
+        msg = _Outgoing(encode_inner(inner | {"lv": self._ver}), False, 1, None, True)
+        self._send_to(nick, peer, msg, res, want=frozenset({d.ed25519}))
 
     def _on_nack(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         self._trim_sent()
@@ -942,8 +1024,12 @@ class Engine:
         self._drop_session(d.curve25519, session_id)
         self._rekeying.add(ed)
         # Re-send the lost message on the new session (the spec's MAY), to
-        # that device only.
+        # that device only: the application's waits for the keys. A CHAL
+        # cannot go on a new session (O1), and a listreq or a t:list is asked
+        # again: the keys are asked for all the same.
         self._send_to(nick, peer, again, res, want=only)
+        if not again.written:
+            self._maybe_keyreq(nick, res)
 
     def _undecryptable(self, nick: str, msg: Assembled, reason: str, peer: Peer,
                        res: Result) -> None:

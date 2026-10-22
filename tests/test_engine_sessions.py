@@ -25,14 +25,16 @@ def test_first_contact_keyreq_keys_pkmsg_then_reply_as_msg(net):
     bot, vjt = paired(net)
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "ciao bot"}))
     assert texts(net.take("bot")) == ["ciao bot"]
-    assert verbs(net) == ["KEYREQ", "KEYS", "PKMSG"]
+    # A PKMSG carries a certificate, not the list: its `lv` (1) is above the
+    # nothing the bot holds, so the bot asks that device for it (listreq),
+    # which answers (t:list), both on the session the PKMSG opened.
+    assert verbs(net) == ["KEYREQ", "KEYS", "PKMSG", "MSG", "MSG"]
+    assert [d.ed25519 for d in bot.devices(vjt.fingerprint)] == [vjt.device_key]
+    assert bot._books[vjt.fingerprint].ver == 1
 
-    # The reply goes at once, on the session vjt's PKMSG opened; and since
-    # the bot holds no list for vjt yet (a PKMSG carries a certificate, not
-    # the list), it asks for one.
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "ciao vjt"}))
     assert texts(net.take("vjt")) == ["ciao vjt"]
-    assert verbs(net)[3:] == ["MSG", "KEYREQ", "KEYS"]
+    assert verbs(net)[5:] == ["MSG"]
 
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "now MSG too"}))
     assert texts(net.take("bot")) == ["now MSG too"]
@@ -502,19 +504,24 @@ def test_olm_decrypts_the_queue_when_refused_messages_fill_the_rest_of_the_cap(n
     assert len(texts(events)) == DEFAULT_MAX_TEXT_MESSAGES - refused
 
 
-def test_a_challenge_that_expired_waiting_for_keys_is_not_sent(net):
-    # Encrypting it would only open a gap in the receiver's Olm chain; the
-    # application hears of it as ChallengeExpired.
+def test_a_challenge_to_a_peer_that_never_wrote_to_us_goes_nowhere(net):
+    # O1: a CHAL is never a pre-key message, and it never waits for keys: a
+    # device that has not written to a session of ours cannot answer for an
+    # order. The application hears of it as ChallengeExpired.
     from irc_olm.challenge import CHALLENGE_TTL
-    from irc_olm.engine import Result
+    from irc_olm.engine import ChallengeExpired
     bot, vjt = paired(net)
     _, res = bot.challenge("vjt", network="n", channel="#c", sender_mask="vjt!v@h", line=b"!op")
-    assert [framing.parse(b).verb for _, b in res.outbound] == ["KEYREQ"]
+    assert res.outbound == [] and res.events == []
+    # Our session, a PKMSG; vjt's listreq on it (the bot's `lv` is news to
+    # it) is lost, so vjt never wrote to it.
+    net.drop = lambda src, dst, body: src == "vjt" and framing.parse(body).verb == "MSG"
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))
+    net.drop = None
+    _, res = bot.challenge("vjt", network="n", channel="#c", sender_mask="vjt!v@h", line=b"!op")
+    assert res.outbound == []
     net.clock.t += CHALLENGE_TTL + 1
-    flushed = Result()
-    for _, body in vjt.receive("bot", res.outbound[0][1]).outbound:
-        flushed.extend(bot.receive("vjt", body))
-    assert flushed.outbound == [] and flushed.urgent == {}
+    assert len([e for e in bot.tick().events if isinstance(e, ChallengeExpired)]) == 2
 
 
 def test_a_retry_keyreq_that_crossed_faster_than_the_first_is_answered(net):

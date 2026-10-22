@@ -386,7 +386,7 @@ def test_lines_carrying_a_pinned_key_from_an_unmapped_nick_get_no_nack(net):
     chat(net, "vjt", "bot", "hi")
     chat(net, "bot", "vjt", "hello")
     (pk,) = net.captured("PKMSG", "vjt")
-    (msg,) = net.captured("MSG", "bot")
+    msg = net.captured("MSG", "bot")[-1]
     for nick in ("mallory1", "mallory2"):
         replay = net.inject(nick, "bot", "PKMSG", pk)
         forged = net.inject(nick, "bot", "MSG", {**msg, "ck": vjt.identity["curve25519"]})

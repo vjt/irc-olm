@@ -138,7 +138,7 @@ def test_submit_all_keeps_order_per_target():
             done.set()
 
     s = PacedSender(send, Pacer(max_lines=3, window=0.1, fakelag=None))
-    s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")], set())
+    s.submit_all([("a", "a1"), ("b", "b1"), ("a", "a2"), ("b", "b2")], {}, set())
     assert done.wait(5)
     assert [x for x in got if x[0] == "a"] == [("a", "a1"), ("a", "a2")]
     assert [x for x in got if x[0] == "b"] == [("b", "b1"), ("b", "b2")]
@@ -290,7 +290,7 @@ def test_submit_all_puts_the_engines_urgent_messages_in_the_fast_lane():
     s = PacedSender(lambda target, line: None, pacer, clock=lambda: 0.0)
     with s._cv:                       # keep the thread off the queue while we look
         refused = s.submit_all([("vjt", b) for b in long_msg + chal],
-                               {framing.parse(chal[0]).msgid: None})
+                               {framing.parse(chal[0]).msgid: None}, set())
         assert refused == []
         assert [line for _, line in pacer.due(1000.0)] == chal[:1]   # 6 s of bank: no room
         assert [line for _, line in pacer.due(1006.0)] == chal[1:]   # for a 5 s long line
@@ -751,18 +751,23 @@ def test_reactive_and_text_lines_leave_the_reserve_to_urgent_ones():
 
 def test_lanes_follow_the_verb_and_the_engines_urgent_set():
     def body(verb, payload=None):
-        return framing.fragment(verb, framing.encode_payload(payload or {"v": 1}),
+        return framing.fragment(verb, framing.encode_payload(payload or {"v": 2}),
                                 **addr(verb), own_mask="bot!b@h", target="vjt")[0]
     chal, text, keyreq = body("MSG"), body("MSG"), body("KEYREQ")
     urgent = {framing.parse(chal).msgid: 15.0, framing.parse(keyreq).msgid: None}
-    assert lane_of(keyreq, urgent) is Lane.URGENT
-    assert lane_of(chal, urgent) is Lane.URGENT
-    assert lane_of(body("PKMSG"), {}) is Lane.TEXT
-    assert lane_of(text, urgent) is Lane.TEXT
+    assert lane_of(keyreq, urgent, set()) is Lane.URGENT
+    assert lane_of(chal, urgent, set()) is Lane.URGENT
+    assert lane_of(body("PKMSG"), {}, set()) is Lane.TEXT
+    assert lane_of(text, urgent, set()) is Lane.TEXT
     for verb in ("KEYS", "NACK"):
         line = body(verb)
-        assert lane_of(line, {framing.parse(line).msgid: None}) is Lane.REACTIVE   # drawn by a peer
-    assert lane_of("not e2e at all", {}) is Lane.TEXT
+        mid = {framing.parse(line).msgid}
+        assert lane_of(line, dict.fromkeys(mid), set()) is Lane.REACTIVE   # drawn by a peer
+    # A listreq or a t:list, inside Olm: drawn by a peer too (amendment O4)
+    for verb in ("MSG", "PKMSG"):
+        line = body(verb)
+        assert lane_of(line, {}, {framing.parse(line).msgid}) is Lane.REACTIVE
+    assert lane_of("not e2e at all", {}, set()) is Lane.TEXT
 
 
 def test_submit_all_admits_each_message_whole_and_returns_the_refused():
@@ -774,7 +779,7 @@ def test_submit_all_admits_each_message_whole_and_returns_the_refused():
         for _ in range(DEFAULT_MAX_TEXT_MESSAGES - 2):
             assert pacer.submit("vjt", _message(1), lane=Lane.TEXT)
         flush = [_message(2), _message(1), _message(3), _message(1)]
-        refused = s.submit_all([("vjt", b) for m in flush for b in m], {})
+        refused = s.submit_all([("vjt", b) for m in flush for b in m], {}, set())
         assert refused == [("vjt", framing.parse(m[0]).msgid) for m in flush[2:]]
         queued = [e.line for e in pacer._queues["vjt"][Lane.TEXT]]
         assert queued[-3:] == flush[0] + flush[1]
@@ -787,7 +792,7 @@ def test_submit_all_reports_only_refused_messages_that_carried_text():
     s = PacedSender(lambda target, line: None, pacer, clock=lambda: 0.0)
     with s._cv:
         assert pacer.submit("mal", [L2] * DEFAULT_MAX_URGENT, lane=Lane.REACTIVE)
-        assert s.submit_all([("mal", b) for b in msg("mal", 2, verb="NACK")], {}) == []
+        assert s.submit_all([("mal", b) for b in msg("mal", 2, verb="NACK")], {}, set()) == []
 
 
 def test_a_chal_passes_its_deadline_from_the_engines_ttl():
@@ -796,7 +801,7 @@ def test_a_chal_passes_its_deadline_from_the_engines_ttl():
     s = PacedSender(lambda target, line: None, pacer, clock=lambda: clock[0])
     with s._cv:
         chal = msg("vjt", 6, 5)
-        s.submit_all([("vjt", b) for b in chal], {framing.parse(chal[0]).msgid: 15.0})
+        s.submit_all([("vjt", b) for b in chal], {framing.parse(chal[0]).msgid: 15.0}, set())
         assert [e.deadline for e in pacer._queues["vjt"][Lane.URGENT]] == [515.0, 515.0]
 
 
@@ -966,7 +971,7 @@ def test_submit_all_refusing_a_plain_line_still_submits_the_rest():
         assert pacer.submit("c", [L5, L5], lane=Lane.TEXT)          # the backlog is full
         chal = msg("lucy", 5, 4)
         refused = s.submit_all([("#chan", "hello")] + [("lucy", b) for b in chal],
-                               {framing.parse(chal[0]).msgid: 15.0})
+                               {framing.parse(chal[0]).msgid: 15.0}, set())
         assert refused == []
         assert [e.line for e in pacer._queues["lucy"][Lane.URGENT]] == chal
 
@@ -1118,7 +1123,7 @@ def test_an_urgent_message_dropped_too_late_is_reported_to_the_application():
     s = PacedSender(lambda target, line: None, Pacer(fakelag=lag), clock=lambda: clock[0],
                     on_lost=on_lost)
     chal = msg("vjt", 5, 4)
-    s.submit_all([("vjt", b) for b in chal], {framing.parse(chal[0]).msgid: 15.0})
+    s.submit_all([("vjt", b) for b in chal], {framing.parse(chal[0]).msgid: 15.0}, set())
     assert done.wait(2)
     assert lost == [("vjt", framing.parse(chal[0]).msgid, "late")]
 
@@ -1278,7 +1283,7 @@ def test_an_on_lost_that_raises_is_logged_and_the_rest_still_reported():
                     on_lost=on_lost)
     for nick in ("vjt", "lucy"):
         chal = msg(nick, 5, 4)
-        s.submit_all([(nick, b) for b in chal], {framing.parse(chal[0]).msgid: 15.0})
+        s.submit_all([(nick, b) for b in chal], {framing.parse(chal[0]).msgid: 15.0}, set())
     assert done.wait(2)
     assert sorted(calls) == ["lucy", "vjt"] and s._thread.is_alive()
 
