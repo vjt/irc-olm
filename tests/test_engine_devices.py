@@ -57,18 +57,21 @@ def test_a_first_message_to_two_devices_is_one_pkmsg_with_a_body_each(net):
 
 
 def test_msg_and_pkmsg_bodies_never_share_a_message_and_the_last_heard_goes_first(net):
-    bot, (a0, a1) = setup(net)
-    a1_did = a1.did
-    # a1 never writes back (its listreq is lost): its session stays a PKMSG one.
-    net.drop = lambda src, dst, body: src == "alice" and framing.parse(body).src == a1_did
+    bot, devs = setup(net)
+    # The device that writes back sorts last by key: only having been heard
+    # from puts it first.
+    quiet, talker = sorted(devs, key=lambda d: d.device_key)
+    t, q, quiet_did = devs.index(talker), devs.index(quiet), quiet.did
+    # `quiet` never writes back (its listreq is lost): its session stays a PKMSG one.
+    net.drop = lambda src, dst, body: src == "alice" and framing.parse(body).src == quiet_did
     net.pump("bot", bot.send("alice", text("ciao")))
-    net.pump("alice.0", a0.send("bot", text("from my phone")))     # a MSG: a0's session answered
+    net.pump(f"alice.{t}", talker.send("bot", text("from my phone")))   # a MSG now
     assert texts(net.take("bot")) == ["from my phone"]
     n = len(sent(net, "bot"))
     net.pump("bot", bot.send("alice", text("both")))
-    assert texts(net.take("alice.0"))[-1] == "both" and texts(net.take("alice.1"))[-1] == "both"
+    assert [texts(net.take(f"alice.{i}"))[-1] for i in (t, q)] == ["both", "both"]
     assert [(v, to, set(p["bodies"])) for v, to, p in sent(net, "bot")[n:]] == [
-        ("MSG", a0.did, {a0.did}), ("PKMSG", a1.did, {a1.did})]
+        ("MSG", talker.did, {talker.did}), ("PKMSG", quiet.did, {quiet.did})]
 
 
 def test_a_device_dropped_from_a_newer_list_is_revoked_for_good(net):
@@ -285,13 +288,17 @@ def held(net, n, verb, src=None):
             and src in (None, framing.parse(b).src)]
 
 
-def test_a_rekey_inside_the_keyreq_budget_waits_for_it_and_later_nacks_join(net):
-    from irc_olm.engine import KEYREQ_RETRY, REKEY_INTERVAL
+def nacked_inside_the_budget(net):
+    """Three devices: a1's grappa holds no keys for it, so every send asks;
+    a0 and a2 restored old backups and NACK "two", and their NACKs come in
+    after the KEYS that "two"'s KEYREQ drew. Returns the bot, the devices and
+    the two NACK lines, a0's first, not delivered yet."""
+    from irc_olm.engine import REKEY_INTERVAL
     bot, (a0, a1, a2) = setup(net, 3)
-    net.no_keys = {a1.device_key}                 # every send asks for a1's keys
+    net.no_keys = {a1.device_key}
     net.pump("bot", bot.send("alice", text("one")))       # a KEYREQ at t=0
     net.clock.t += REKEY_INTERVAL + 1
-    a0.forget_sessions(bot.fingerprint)           # two devices restored old backups
+    a0.forget_sessions(bot.fingerprint)
     a2.forget_sessions(bot.fingerprint)
     n = len(net.wire)
     net.drop = lambda src, dst, body: src == "alice"      # alice's side answers late
@@ -299,7 +306,12 @@ def test_a_rekey_inside_the_keyreq_budget_waits_for_it_and_later_nacks_join(net)
     net.drop = None
     for line in held(net, n, "KEYS"):             # a0 and a2 still look fine: opens nothing
         bot.receive("alice", line)
-    nacks = held(net, n, "NACK")                  # a0's, then a2's
+    return bot, (a0, a1, a2), held(net, n, "NACK")
+
+
+def test_a_rekey_inside_the_keyreq_budget_waits_for_it_and_later_nacks_join(net):
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0, a1, a2), nacks = nacked_inside_the_budget(net)
     net.clock.t += 1
     first = bot.receive("alice", nacks[0])
     assert [e.device for e in first.events if isinstance(e, Rekeying)] == [a0.device_key]
@@ -312,6 +324,16 @@ def test_a_rekey_inside_the_keyreq_budget_waits_for_it_and_later_nacks_join(net)
     net.pump("bot", bot.tick())                   # t=91: due, and asked
     assert [texts(net.take(f"alice.{i}"))[-1:] for i in (0, 2)] == [["two"], ["two"]]
     assert net.take("bot", SendFailed) == []
+
+
+def test_a_due_rekey_asks_nothing_of_a_nick_unpinned_since(net):
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0, a1, a2), nacks = nacked_inside_the_budget(net)
+    net.clock.t += 1
+    assert [e for e in bot.receive("alice", nacks[0]).events if isinstance(e, Rekeying)]
+    bot.set_pins({})
+    net.clock.t += KEYREQ_RETRY
+    assert bot.tick().outbound == []
 
 
 def test_a_rekey_whose_keys_open_nothing_still_counts_for_the_minute(net):
@@ -331,3 +353,106 @@ def test_a_rekey_whose_keys_open_nothing_still_counts_for_the_minute(net):
     late = bot.receive("alice", held(net, n, "NACK", a1_did)[0])
     assert [e.reason for e in late.events if isinstance(e, SendFailed)] == ["rekey-throttled"]
     assert not [e for e in late.events if isinstance(e, Rekeying)] and late.outbound == []
+
+
+def payload_of(res, verb):
+    return framing.decode_payload("".join(
+        f.chunk for f in (framing.parse(b) for _, b in res.outbound) if f.verb == verb))
+
+
+@pytest.mark.parametrize("path", ["keys", "list"])
+def test_a_revoked_devices_sessions_go_whichever_way_the_list_came(net, path):
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0, a1, a2) = setup(net, 3)
+    net.no_keys = {a2.device_key}                 # so that a later send asks for keys
+    net.pump("bot", bot.send("alice", text("one")))
+    curve = a1.identity["curve25519"]
+    assert bot._sessions.get(curve)
+    net.relist("alice", [a0, a2], 2)              # a1 is stolen
+    net.clock.t += KEYREQ_RETRY
+    if path == "keys":
+        net.pump("bot", bot.send("alice", text("two")))           # its KEYS holds list 2
+    else:
+        net.pump("alice.0", a0.send("bot", text("I revoked a1")))  # its lv draws list 2
+    assert bot._books[a0.fingerprint].ver == 2
+    assert curve not in bot._sessions
+
+
+def test_keys_open_no_new_session_to_a_device_whose_session_works(net):
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0, a1) = setup(net)
+    net.no_keys = {a1.device_key}
+    net.pump("bot", bot.send("alice", text("one")))
+    curve = a0.identity["curve25519"]
+    working = [s.session_id for s in bot._sessions[curve]]
+    net.no_keys = set()
+    net.clock.t += KEYREQ_RETRY
+    net.pump("bot", bot.send("alice", text("two")))       # its KEYS holds a0's entry too
+    assert texts(net.take("alice.1")) == ["one", "two"]
+    assert [s.session_id for s in bot._sessions[curve]] == working
+
+
+def test_a_msg_reframed_as_another_devices_is_dropped(net):
+    bot, (a0, a1) = setup(net)
+    net.pump("bot", bot.send("alice", text("hi")))
+    p = payload_of(a0.send("bot", text("from a0")), "MSG")
+    res = net.inject("alice.0", "bot", "MSG", p, frm=a1.did)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["from-mismatch"]
+    assert texts(res.events) == [] and res.outbound == []
+
+
+def test_a_copy_that_reached_a_device_is_not_lost_to_a_full_queue(net):
+    from irc_olm.engine import OUTQ_MAX
+    bot, (a0, a1) = setup(net)
+    net.no_keys = {a1.device_key}                 # every copy for a1 waits
+    for i in range(OUTQ_MAX + 1):
+        net.pump("bot", bot.send("alice", text(f"m{i}")))
+    assert len(texts(net.take("alice.0"))) == OUTQ_MAX + 1
+    assert net.take("bot", SendFailed) == []
+
+
+def test_a_nack_from_a_device_revoked_since_is_dropped_and_rekeys_nothing(net):
+    from irc_olm.engine import REKEY_INTERVAL
+    bot, (a0, a1, a2) = setup(net, 3)
+    net.pump("bot", bot.send("alice", text("one")))
+    ref = [framing.parse(b).msgid for s, _, b in net.wire
+           if s == "bot" and framing.parse(b).verb == "PKMSG"][0]
+    net.relist("alice", [a0, a2], 2)
+    net.pump("alice.0", a0.send("bot", text("I revoked a1")))
+    assert bot._books[a0.fingerprint].ver == 2
+    net.clock.t += REKEY_INTERVAL
+    res = net.inject("alice.1", "bot", "NACK", {"v": 2, "ref": ref})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["revoked-device"]
+    assert not [e for e in res.events if isinstance(e, Rekeying)] and res.outbound == []
+
+
+def test_unpinning_a_master_forgets_its_devices_but_not_its_list(net):
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0, a1) = setup(net)
+    net.pump("bot", bot.send("alice", text("one")))
+    bot.set_pins({})
+    bot.set_pins({"alice": a0.fingerprint})
+    assert bot.devices(a0.fingerprint) == []
+    assert bot._books[a0.fingerprint].ver == 1    # a re-pin cannot roll it back
+    net.clock.t += KEYREQ_RETRY
+    res = bot.send("alice", text("two"))
+    assert [framing.parse(b).verb for _, b in res.outbound] == ["KEYREQ"]
+
+
+def test_the_engines_inner_fields_are_its_own_both_ways(net, monkeypatch):
+    import json
+    bot, (a0,) = setup(net, 1)
+
+    def first_wins(text):
+        # RFC 8259 leaves two equal names open: a peer whose parser keeps the
+        # first must still read our `fb`, never one the application wrote.
+        def pairs(items):
+            out = {}
+            for k, v in items:
+                out.setdefault(k, v)
+            return out
+        return json.loads(text, object_pairs_hook=pairs)
+    monkeypatch.setattr(framing, "loads", first_wins)
+    net.pump("bot", bot.send("alice", {"t": "text", "body": "x", "lv": 99, "fb": "forged"}))
+    (got,) = net.take("alice.0", Received)
+    assert got.inner == {"t": "text", "body": "x"}

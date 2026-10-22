@@ -296,6 +296,18 @@ def test_submit_all_puts_the_engines_urgent_messages_in_the_fast_lane():
         assert [line for _, line in pacer.due(1006.0)] == chal[1:]   # for a 5 s long line
 
 
+def test_submit_all_puts_the_engines_reactive_messages_ahead_of_text():
+    from irc_olm.pacing import PacedSender
+    long_msg, t_list = _message(12), _message(2)
+    pacer = Pacer(fakelag=FakeLag())
+    s = PacedSender(lambda target, line: None, pacer, clock=lambda: 0.0)
+    with s._cv:                       # keep the thread off the queue while we look
+        refused = s.submit_all([("vjt", b) for b in long_msg + t_list], {},
+                               {framing.parse(t_list[0]).msgid})
+        assert refused == []
+        assert [line for _, line in pacer.due(1000.0)][:1] == t_list[:1]
+
+
 def test_an_idle_target_leaves_nothing_behind():
     p = Pacer(fakelag=None)
     for i in range(50):

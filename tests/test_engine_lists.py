@@ -85,6 +85,22 @@ def test_a_huge_lv_from_one_device_silences_no_later_listreq(net):
     assert listreqs(a0, "I revoked a1") == 1
 
 
+def test_a_new_lv_inside_the_minute_waits_for_the_minute(net):
+    from irc_olm.engine import LISTREQ_INTERVAL
+    bot, (a0, a1) = setup(net, 2)
+    net.pump("bot", bot.send("alice", text("hi")))
+
+    def listreqs(dev, body):
+        return len(olm_msgids(feed(bot, "alice", dev.send("bot", text(body)))))
+
+    net.relist("alice", [a0, a1], 2)
+    assert listreqs(a0, "lv 2") == 1             # its answer is lost
+    net.relist("alice", [a0, a1], 3)
+    assert listreqs(a0, "lv 3, inside the minute") == 0
+    net.clock.t += LISTREQ_INTERVAL
+    assert listreqs(a1, "lv 3, a minute on") == 1
+
+
 def test_a_listreq_is_answered_once_per_device_a_minute(net):
     from irc_olm.engine import LISTREQ_INTERVAL
     bot, (a0, a1) = setup(net, 2)
@@ -119,6 +135,7 @@ def test_a_list_signed_by_another_master_is_the_alarm(net):
     res = feed(bot, "alice", a0.send("bot", {"t": "list", "master": mallory.master_block}))
     (alarm,) = [e for e in res.events if isinstance(e, KeyAlarm)]
     assert (alarm.pinned, alarm.presented) == (a0.fingerprint, mallory.fingerprint)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["wrong-master"]
     assert bot._books[a0.fingerprint].ver == 1
     res = feed(bot, "alice", a0.send("bot", {"t": "list", "master": {"ed25519": "x"}}))
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["invalid-list"]

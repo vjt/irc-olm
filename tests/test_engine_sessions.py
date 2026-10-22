@@ -572,3 +572,42 @@ def test_a_message_evicted_by_the_global_reassembly_cap_is_reported(net):
     res = bot.receive("nick2", frags(600)[0])
     assert [(e.nick, e.reason, e.verb) for e in res.events] == \
         [("nick0", "reassembly:global-byte-cap", "MSG")]
+
+
+@pytest.mark.parametrize("v", [1, 3, None])
+def test_a_message_of_another_wire_version_is_dropped_unanswered(net, v):
+    bot, _ = paired(net)
+    res = net.inject("vjt", "bot", "KEYREQ", {} if v is None else {"v": v})
+    assert [(e.reason, e.verb) for e in res.events] == [("wire-version", "KEYREQ")]
+    assert res.outbound == []
+
+
+def test_a_line_to_another_device_is_dropped_unread(net):
+    bot, _ = paired(net)
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hi"}))
+    (ref,) = {f.msgid for f in (framing.parse(b) for s, _, b in net.wire if s == "bot")
+              if f.verb == "PKMSG"}
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref}, to=net.add("carol").did)
+    assert [(e.reason, e.verb) for e in res.events] == [("not-for-this-device", "NACK")]
+    assert res.outbound == []
+
+
+def test_a_keys_part_way_in_holds_the_keyreq_retry(net):
+    # Amendment O2(b): the retry restarts on every line of the KEYS, however
+    # long its lines take to come.
+    from irc_olm.engine import KEYREQ_RETRY, Result
+    bot = net.add("bot")
+    net.add_user("alice", 4)                      # four entries: a KEYS of several lines
+    net.pair("bot", "alice")
+    keyreq = bot.send("alice", {"t": "text", "body": "one"}).outbound[0][1]
+    lines = [b for _, b in net._grappa_keys("alice", "bot", keyreq).outbound]
+    assert len(lines) > 1
+    net.clock.t += KEYREQ_RETRY - 1
+    bot.receive("alice", lines[0])
+    net.clock.t += 2                              # past the retry, counted from the KEYREQ
+    assert bot.send("alice", {"t": "text", "body": "two"}).outbound == []
+    rest = Result()
+    for line in lines[1:]:
+        rest.extend(bot.receive("alice", line))
+    net.pump("bot", rest)
+    assert texts(net.take("alice.0")) == ["one", "two"]
