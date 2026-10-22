@@ -88,9 +88,20 @@ def encode_payload(obj: dict) -> str:
     return base64.b64encode(raw).decode()
 
 
+def _refuse_constant(name: str):
+    raise ValueError(f"{name} is not JSON")
+
+
+def loads(text: str | bytes):
+    """RFC 8259 JSON only. Python's json also takes NaN, Infinity and
+    -Infinity, and JavaScript's JSON.parse does not: the same bytes must say
+    the same thing to a bot and to cicchetto."""
+    return json.loads(text, parse_constant=_refuse_constant)
+
+
 def decode_payload(data: str) -> dict:
     try:
-        obj = json.loads(base64.b64decode(data, validate=True).decode())
+        obj = loads(base64.b64decode(data, validate=True).decode())
     except (binascii.Error, UnicodeDecodeError, ValueError) as e:
         raise PayloadError(f"undecodable payload: {e}") from e
     except RecursionError as e:

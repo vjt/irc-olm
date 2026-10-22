@@ -617,7 +617,7 @@ class Engine:
 
     def _deliver(self, nick: str, peer: Peer, plaintext: bytes, res: Result) -> None:
         try:
-            inner = json.loads(plaintext.decode())
+            inner = framing.loads(plaintext.decode())
         except (UnicodeDecodeError, ValueError, RecursionError):
             res.events.append(Dropped(nick, "undecodable-inner"))
             return

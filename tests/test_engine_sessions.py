@@ -225,6 +225,22 @@ def test_a_deeply_nested_inner_message_is_dropped_not_raised(net):
         assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["undecodable-inner"]
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_an_inner_message_json_cannot_spell_is_dropped(net, constant):
+    # Python's json takes them, JSON.parse does not: a bot and cicchetto
+    # would disagree on what the same bytes say.
+    bot, vjt = paired(net)
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "a"}))
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "b"}))
+    net.take("bot")
+    session = vjt._sessions[bot.identity["curve25519"]][0]
+    _, ct = session.encrypt(('{"t":"text","body":"x","n":' + constant + "}").encode()).to_parts()
+    res = net.inject("vjt", "bot", "MSG", {"v": 1, "ck": vjt.identity["curve25519"],
+                                           "body": base64.b64encode(ct).decode().rstrip("=")})
+    assert texts(res.events) == []
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["undecodable-inner"]
+
+
 def test_a_body_that_is_not_base64_is_dropped_not_raised(net):
     bot, vjt = paired(net)
     res = net.inject("bot", "vjt", "PKMSG", {"v": 1, "id": bot.identity, "body": "!!!"})

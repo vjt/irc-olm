@@ -39,6 +39,9 @@ def test_payload_is_padded_base64_of_compact_utf8_json():
     base64.b64encode(b"\xff\xfe").decode(),              # not utf-8
     base64.b64encode(b"[1,2]").decode(),                 # not an object
     base64.b64encode(b"{nope").decode(),                 # not json
+    base64.b64encode(b'{"v":NaN}').decode(),             # not RFC 8259, though
+    base64.b64encode(b'{"v":Infinity}').decode(),        # Python's json takes them
+    base64.b64encode(b'{"v":-Infinity}').decode(),
 ])
 def test_decode_payload_rejects_garbage(bad):
     with pytest.raises(framing.PayloadError):
