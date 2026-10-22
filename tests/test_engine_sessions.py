@@ -387,13 +387,13 @@ def test_a_message_too_long_leaves_the_olm_chain_where_it_was(net):
 
 def test_a_first_pkmsg_that_opens_no_session_gets_a_nack(net):
     import vodozemac as vz
-    from irc_olm.engine import b64u
+    from irc_olm.engine import b64
     bot, vjt = paired(net)
     # vjt's first message, on a one-time key the bot never published
     junk = vz.Account().curve25519_key
     session = vjt._account.create_outbound_session(bot._account.curve25519_key, junk)
     _, ct = session.encrypt(b'{"t":"text","body":"x"}').to_parts()
-    res = net.inject("vjt", "bot", "PKMSG", {"v": 1, "id": vjt.identity, "body": b64u(ct)})
+    res = net.inject("vjt", "bot", "PKMSG", {"v": 1, "id": vjt.identity, "body": b64(ct)})
     assert [e.reason.split(":")[0] for e in res.events if isinstance(e, Undecryptable)] == \
         ["session-creation"]
     assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]

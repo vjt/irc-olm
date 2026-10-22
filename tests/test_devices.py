@@ -38,16 +38,25 @@ def resign(master, block):
 
 # --- did ------------------------------------------------------------------
 
+# The vectors of the base64url amendment (grappa-irc#2430, 6348464388): grappa
+# and cicchetto pin the same two, so the three implementations agree on bytes.
+VECTOR_2 = "7l01yXGoarYtEU3nwHF01/CIo8/r8U0lJ01TnULT9IY"   # raw = sha256("irc-e2e did vector 70")
+
+
 def test_did_is_the_first_8_bytes_of_sha256_over_the_raw_key():
     assert did(RFC_KEY_1) == "If4x36FUomE"
     assert did(RFC_KEY_2) == "OfcT0KZEJT8"
 
 
-def test_did_is_11_characters_of_standard_base64():
+def test_did_is_base64url_so_it_can_sit_in_a_url_path():
+    assert did(VECTOR_2) == "_Uw_z3-OAsk"            # its standard form, /Uw/z3+OAsk, splits a path
+
+
+def test_did_is_11_characters_of_unpadded_base64url():
     for k in keys(20):
         d = did(k)
         assert len(d) == 11
-        assert set(d) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        assert set(d) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
 
 # --- encodings ------------------------------------------------------------

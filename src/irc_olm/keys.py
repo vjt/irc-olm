@@ -15,19 +15,28 @@ import vodozemac as vz
 SIG_LEN = 86
 
 
-def b64u(data: bytes) -> str:
+def b64(data: bytes) -> str:
+    """Standard base64, unpadded: how keys, signatures and Olm bodies travel."""
     return base64.b64encode(data).decode().rstrip("=")
 
 
-def unb64u(text: str) -> bytes:
+def unb64(text: str) -> bytes:
+    """`b64` back to bytes. Python's decoder wants the padding, so it goes
+    back on first; anything outside the standard alphabet is refused."""
     return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+
+
+def b64url(data: bytes) -> str:
+    """Base64url (RFC 4648 §5), unpadded: only for a did, which grappa puts
+    in a URL path, where the standard alphabet's `/` would split it."""
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
 def ed25519_key(key: str) -> vz.Ed25519PublicKey:
     """An Ed25519 key from base64. Raises ValueError on a malformed one.
     vodozemac 0.10 PANICS on a key of 33 bytes, and pyo3 raises that as a
     PanicException, a BaseException: it never sees anything but 32."""
-    if len(unb64u(key)) != 32:
+    if len(unb64(key)) != 32:
         raise ValueError("an Ed25519 key is 32 bytes")
     return vz.Ed25519PublicKey.from_base64(key)
 

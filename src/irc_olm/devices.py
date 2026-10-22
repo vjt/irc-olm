@@ -27,7 +27,7 @@ from enum import Enum
 
 import vodozemac as vz
 
-from .keys import b64u, is_curve, is_key, sig_ok, unb64u
+from .keys import b64url, is_curve, is_key, sig_ok, unb64
 
 MAX_DEVICES = 4              # on the wire: raising it is a new protocol version
 VER_MAX = 2**31 - 1
@@ -40,8 +40,9 @@ class InvalidBlock(ValueError):
 
 
 def did(ed25519: str) -> str:
-    """The first 8 bytes of SHA-256 over the raw key: 11 base64 characters."""
-    return b64u(hashlib.sha256(unb64u(ed25519)).digest()[:8])
+    """The first 8 bytes of SHA-256 over the raw key: 11 base64url characters
+    (the amendment 6348464388), since grappa routes a did in a URL path."""
+    return b64url(hashlib.sha256(unb64(ed25519)).digest()[:8])
 
 
 def wire_int(value: object) -> int | None:

@@ -33,7 +33,7 @@ import vodozemac as vz
 from . import framing
 from .challenge import Challenge, ChallengeBook, new_challenge
 from .framing import PayloadError, fold
-from .keys import b64u, ed25519_key, sig_ok, unb64u
+from .keys import b64, ed25519_key, sig_ok, unb64
 from .reassembly import Assembled, Reassembler, Rejected
 from .store import StateFile
 
@@ -407,10 +407,10 @@ class Engine:
         before = sessions[0].pickle(self._key)
         mtype, ct = sessions[0].encrypt(msg.plaintext).to_parts()
         if mtype == 0:
-            verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self.identity, "body": b64u(ct)}
+            verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self.identity, "body": b64(ct)}
         else:
             verb, payload = "MSG", {"v": WIRE_VERSION, "ck": self.identity["curve25519"],
-                                    "body": b64u(ct)}
+                                    "body": b64(ct)}
         try:
             msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent, ttl=ttl)
         except PayloadError:
@@ -548,7 +548,7 @@ class Engine:
         peer = self._identify(nick, payload["id"], res, proving=True)
         if peer is None:
             return
-        any_msg = vz.AnyOlmMessage.from_parts(0, unb64u(payload["body"]))
+        any_msg = vz.AnyOlmMessage.from_parts(0, unb64(payload["body"]))
         pre = any_msg.to_pre_key()
         sessions = self._sessions.get(peer.curve25519, [])
         for s in sessions:
@@ -592,7 +592,7 @@ class Engine:
             return self._undecryptable(nick, msg.msgid, "no-session", peer, res)
         # Nothing about the peer moves before a decrypt succeeds: `ck` is
         # public, and anyone can put it on a line.
-        any_msg = vz.AnyOlmMessage.from_parts(1, unb64u(payload["body"]))
+        any_msg = vz.AnyOlmMessage.from_parts(1, unb64(payload["body"]))
         for s in list(self._sessions[peer.curve25519]):
             try:
                 return self._decrypted(nick, peer, msg, s, any_msg, res)
