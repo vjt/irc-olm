@@ -1026,12 +1026,14 @@ class Engine:
             # The failed session is not our newest: re-send on the newest.
             self._drop_session(d.curve25519, session_id)
             return self._send_to(nick, peer, again, res, want=only)
-        if key not in self._keyreq_out and key not in self._rekey_due:
+        asked = key in self._keyreq_out and self._now() - self._keyreq_at[key] < KEYREQ_RETRY
+        if not asked and key not in self._rekey_due:
             # The failed session is our newest: only a new one helps, and the
             # spec allows one re-key per nick per minute, however many of its
             # devices NACKed: a NACK while one is under way joins it. Its
             # KEYREQ keeps to the one budget, one per nick per 30 s: it goes
-            # now, or when tick() finds it due.
+            # now, or when tick() finds it due. A KEYREQ no KEYS line answered
+            # within the retry is lost, and no re-key to join.
             last = self._rekey_at.get(key)
             if last is not None and self._now() - last < REKEY_INTERVAL:
                 self._lost(nick, "rekey-throttled", [sent.msg], res)

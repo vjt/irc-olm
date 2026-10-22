@@ -497,3 +497,18 @@ def test_the_rekey_minute_runs_from_the_rekey_not_from_its_keys(net):
     net.pump("bot", bot.send("alice", text("three")))
     assert [e.device for e in net.take("bot", Rekeying)] == [a0.device_key]
     assert net.take("bot", SendFailed) == []
+
+
+def test_a_keyreq_whose_keys_never_came_is_no_rekey_to_join_past_the_retry(net):
+    from irc_olm.engine import KEYREQ_RETRY, REKEY_INTERVAL
+    bot, devs = setup(net, 3)
+    net.pump("bot", bot.send("alice", text("one")))
+    net.clock.t += REKEY_INTERVAL + 1
+    two = bot.send("alice", text("two"))
+    (ref,) = {f.msgid for f in (framing.parse(b) for _, b in two.outbound) if f.verb == "MSG"}
+    first = net.inject("alice.0", "bot", "NACK", {"v": 2, "ref": ref})   # its KEYS is lost
+    assert [e.device for e in first.events if isinstance(e, Rekeying)] == [devs[0].device_key]
+    net.clock.t += KEYREQ_RETRY
+    late = net.inject("alice.1", "bot", "NACK", {"v": 2, "ref": ref})
+    assert [e.reason for e in late.events if isinstance(e, SendFailed)] == ["rekey-throttled"]
+    assert late.outbound == []
