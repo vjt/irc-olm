@@ -6,9 +6,9 @@ import pytest
 import vodozemac as vz
 
 from irc_olm import devices
-from irc_olm.devices import (MAX_DEVICES, Book, Change, DeviceList, InvalidBlock, did, id_block,
-                             id_ok, list_text, parse_keys, parse_master, sign_master,
-                             wire_int)
+from irc_olm.devices import (MAX_DEVICES, Book, Change, DeviceList, InvalidBlock, binding,
+                             cert_ok, cert_text, did, id_block, id_ok, list_text, parse_keys,
+                             parse_master, parse_master_ref, sign_cert, sign_master, wire_int)
 
 # RFC 8032, 7.1, tests 1 and 2: public keys anyone can check the dids of.
 RFC_KEY_1 = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo"
@@ -280,6 +280,55 @@ def test_a_malformed_id_block_does_not_verify(master, mangle):
     assert not id_ok(mangle(id_block(vz.Account(), m_key(master))), m_key(master))
 
 
+# --- the device certificate and the PKMSG's master block --------------------
+
+def test_cert_text_is_the_signed_string():
+    assert cert_text(RFC_KEY_1) == "irc-e2e:v2:dev:" + RFC_KEY_1
+
+
+def test_a_cert_verifies_under_its_master_for_its_device(master):
+    dev = vz.Account()
+    c = sign_cert(master, ed(dev))
+    assert cert_ok(m_key(master), ed(dev), c)
+    assert not cert_ok(m_key(vz.Account()), ed(dev), c)         # another master
+    assert not cert_ok(m_key(master), ed(vz.Account()), c)      # another device
+    assert not cert_ok(m_key(master), ed(dev), c + "A")
+    assert not cert_ok(m_key(master), ed(dev), None)
+
+
+def test_a_list_signature_is_not_a_cert(master):
+    dev = vz.Account()
+    block = sign_master(master, 1, [ed(dev)])
+    assert not cert_ok(m_key(master), ed(dev), block["sig"])
+
+
+def test_the_pkmsg_master_block_parses_into_its_key_and_cert(master):
+    dev = vz.Account()
+    c = sign_cert(master, ed(dev))
+    assert parse_master_ref({"ed25519": m_key(master), "cert": c, "x": 1}) == (m_key(master), c)
+
+
+@pytest.mark.parametrize("mangle", [
+    lambda b: None,
+    lambda b: [],
+    lambda b: {**b, "ed25519": b["ed25519"] + "="},
+    lambda b: {k: v for k, v in b.items() if k != "cert"},
+    lambda b: {**b, "cert": 7},
+    lambda b: {**b, "cert": b["cert"][:-1]},
+])
+def test_a_malformed_pkmsg_master_block_does_not_parse(master, mangle):
+    block = {"ed25519": m_key(master), "cert": sign_cert(master, ed(vz.Account()))}
+    with pytest.raises(InvalidBlock):
+        parse_master_ref(mangle(block))
+
+
+# --- the fk/tk binding ------------------------------------------------------
+
+def test_the_binding_is_16_bytes_of_sha256_over_both_keys_in_order():
+    assert binding(RFC_KEY_1, RFC_KEY_2) == "l+TpsPRwYcy6cwpxK79anQ"
+    assert binding(RFC_KEY_2, RFC_KEY_1) == "V94U/7K/o6CVvEgCpfxUhQ"   # sender first
+
+
 # --- KEYS v2 --------------------------------------------------------------
 
 def keys_payload(master, accounts, ver=1, listed=None):
@@ -438,7 +487,7 @@ def bound(master, n, ver=1):
     eds = [a.ed25519_key.to_base64() for a in accounts]
     book = Book.first(lst(master, ver, eds))
     for a in accounts:
-        book.bind(id_block(a, m_key(master)), proven=False)
+        book.bind(id_block(a, m_key(master)), proven=False, cert=None)
     return book, accounts
 
 
@@ -453,8 +502,8 @@ def curve(account):
 def test_targets_are_the_listed_devices_with_a_curve(master):
     a, b, c = vz.Account(), vz.Account(), vz.Account()
     book = Book.first(lst(master, 1, sorted([ed(a), ed(b), ed(c)])))
-    book.bind(id_block(a, m_key(master)), proven=False)
-    book.bind(id_block(c, m_key(master)), proven=True)
+    book.bind(id_block(a, m_key(master)), proven=False, cert=None)
+    book.bind(id_block(c, m_key(master)), proven=True, cert=None)
     assert {d.ed25519 for d in book.targets()} == {ed(a), ed(c)}
 
 
@@ -482,20 +531,55 @@ def test_device_for_curve_finds_only_listed_devices(master):
     assert book.device_for_curve(curve(vz.Account())) is None
 
 
+def test_bind_takes_an_unlisted_device_its_master_certified(master):
+    book, (a,) = bound(master, 1)
+    b = vz.Account()                           # paired after the list we hold
+    d = book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
+    assert d.certified and not book.listed(ed(b))
+    assert {x.ed25519 for x in book.targets()} == {ed(a), ed(b)}
+    assert book.device_for_curve(curve(b)).ed25519 == ed(b)
+
+
+def test_bind_refuses_a_cert_that_does_not_verify(master):
+    book, _ = bound(master, 1)
+    b = vz.Account()
+    with pytest.raises(ValueError):
+        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(vz.Account(), ed(b)))
+    assert book.device(ed(b)) is None
+
+
+def test_a_revoked_device_is_not_trusted_on_its_cert(master):
+    book, (a, b) = bound(master, 2)
+    book.apply(lst(master, 2, [ed(a)]))
+    with pytest.raises(ValueError):
+        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
+    assert ed(b) not in {x.ed25519 for x in book.targets()}
+
+
+def test_a_certified_device_dropped_by_a_later_list_is_revoked(master):
+    book, (a,) = bound(master, 1)
+    b = vz.Account()
+    book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
+    book.apply(lst(master, 2, sorted([ed(a), ed(b)])))
+    book.apply(lst(master, 3, [ed(a)]))
+    assert book.revoked(ed(b))
+    assert [x.ed25519 for x in book.targets()] == [ed(a)]
+
+
 def test_bind_takes_only_a_listed_device(master):
     book, _ = bound(master, 1)
     with pytest.raises(ValueError):
-        book.bind(id_block(vz.Account(), m_key(master)), proven=False)
+        book.bind(id_block(vz.Account(), m_key(master)), proven=False, cert=None)
 
 
 def test_bind_takes_only_an_id_block_signed_for_its_master(master):
     a = vz.Account()
     book = Book.first(lst(master, 1, [ed(a)]))
     with pytest.raises(ValueError):
-        book.bind(id_block(a, m_key(vz.Account())), proven=False)
+        book.bind(id_block(a, m_key(vz.Account())), proven=False, cert=None)
     with pytest.raises(ValueError):
         book.bind({**id_block(a, m_key(master)), "curve25519": curve(vz.Account())},
-                  proven=False)
+                  proven=False, cert=None)
     assert book.targets() == []
 
 
@@ -506,16 +590,16 @@ def test_bind_keeps_the_first_curve_and_records_a_proof(master):
     forged = {"curve25519": other, "ed25519": ed(a),
               "sig": a.sign(("irc-e2e:v2:id:" + other + ":" + m_key(master)).encode()).to_base64()}
     with pytest.raises(ValueError):
-        book.bind(forged, proven=True)
-    book.bind(id_block(a, m_key(master)), proven=True)
+        book.bind(forged, proven=True, cert=None)
+    book.bind(id_block(a, m_key(master)), proven=True, cert=None)
     assert book.device(ed(a)).proven
     assert book.device(ed(a)).curve25519 == curve(a)
 
 
 def test_a_proof_is_never_taken_back(master):
     book, (a,) = bound(master, 1)
-    book.bind(id_block(a, m_key(master)), proven=True)
-    book.bind(id_block(a, m_key(master)), proven=False)
+    book.bind(id_block(a, m_key(master)), proven=True, cert=None)
+    book.bind(id_block(a, m_key(master)), proven=False, cert=None)
     assert book.device(ed(a)).proven
 
 
@@ -528,10 +612,13 @@ def test_heard_on_an_unbound_device_is_ignored(master):
 def test_a_book_survives_a_round_trip(master):
     book, (a, b, c) = bound(master, 3)
     book.heard(ed(b), 42.0)
-    book.bind(id_block(a, m_key(master)), proven=True)
+    book.bind(id_block(a, m_key(master)), proven=True, cert=None)
     book.apply(lst(master, 2, sorted([ed(a), ed(b)])))
     again = Book.from_doc(book.to_doc())
     assert again.master == book.master and again.ver == 2
     assert [d for d in again.targets()] == [d for d in book.targets()]
     assert again.revoked(ed(c)) and again.revoked_curve(curve(c))
     assert again.device(ed(a)).proven
+    d = vz.Account()
+    book.bind(id_block(d, m_key(master)), proven=True, cert=sign_cert(master, ed(d)))
+    assert Book.from_doc(book.to_doc()).device(ed(d)).certified

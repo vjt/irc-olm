@@ -3,8 +3,11 @@
 A user holds one master Ed25519 key per network, and the master signs the
 list of the user's device keys: 1 to 4 of them, with a version `ver` that
 only ever grows. Each device signs its master in its id block, so no other
-master can list it. The pin is on the master; a device is trusted through
-the list.
+master can list it. The pin is on the master. A device is trusted through
+the list (KEYS, `t:list`), or through its certificate, the master's
+signature over its key, which a pre-key message carries instead of the list
+(wire v2 revision 2, grappa-irc#2430, 6346686730): the certificate and the
+id block verify and the key was never revoked here.
 
 A `did` (device id) only addresses a line: nothing is trusted because of one.
 It is computed from a key already checked, never taken from the wire.
@@ -12,11 +15,6 @@ It is computed from a key already checked, never taken from the wire.
 `Book` is what a receiver keeps per master: the stored list (trust rule 3),
 every key it ever listed (so a revoked key is one listed once and not now,
 rule 5), and the curve of each device a session was bound to.
-
-PROVISIONAL: the master block, the id block and the KEYS shape follow the
-wire v2 proposal (grappa-irc#2430, 6346236542 + 6346384093), which vjt has
-not acked; a revision with per-device certificates is under way. `did`,
-`wire_int`, the cap and the fan-out order do not depend on it.
 """
 
 from __future__ import annotations
@@ -27,12 +25,14 @@ from enum import Enum
 
 import vodozemac as vz
 
-from .keys import b64url, is_curve, is_key, sig_ok, unb64
+from .keys import SIG_LEN, b64, b64url, is_curve, is_key, sig_ok, unb64
 
 MAX_DEVICES = 4              # on the wire: raising it is a new protocol version
 VER_MAX = 2**31 - 1
 LIST_SIG_PREFIX = "irc-e2e:v2:list:"
 ID_SIG_PREFIX = "irc-e2e:v2:id:"
+CERT_SIG_PREFIX = "irc-e2e:v2:dev:"
+BIND_PREFIX = "irc-e2e:v2:bind:"
 
 
 class InvalidBlock(ValueError):
@@ -66,6 +66,26 @@ def list_text(ver: int, devices: list[str] | tuple[str, ...]) -> str:
 
 def id_text(curve25519: str, master: str) -> str:
     return f"{ID_SIG_PREFIX}{curve25519}:{master}"
+
+
+def cert_text(ed25519: str) -> str:
+    return f"{CERT_SIG_PREFIX}{ed25519}"
+
+
+def sign_cert(master: vz.Account, ed25519: str) -> str:
+    """The master's certificate for one of its devices, made once at pairing."""
+    return master.sign(cert_text(ed25519).encode()).to_base64()
+
+
+def cert_ok(master: str, ed25519: str, cert: object) -> bool:
+    return sig_ok(master, cert_text(ed25519), cert)
+
+
+def binding(sender: str, recipient: str) -> str:
+    """The fk/tk binding (`fb`) of an inner message sent in a pre-key body:
+    16 bytes of SHA-256 over both device keys, sender first, 22 characters.
+    128 bits cannot be found by search, so it binds as the two full keys did."""
+    return b64(hashlib.sha256(f"{BIND_PREFIX}{sender}:{recipient}".encode()).digest()[:16])
 
 
 @dataclass(frozen=True)
@@ -104,6 +124,20 @@ def parse_master(block: object) -> DeviceList:
     if not sig_ok(master, list_text(ver, devices), block.get("sig")):
         raise InvalidBlock("the list signature does not verify")
     return DeviceList(master, ver, tuple(devices))
+
+
+def parse_master_ref(block: object) -> tuple[str, str]:
+    """A pre-key message's master block, `{"ed25519": M, "cert": C}`: the
+    master and the sender's certificate, shaped but not yet verified (the
+    caller holds the pin and the sender's key), or InvalidBlock."""
+    if not isinstance(block, dict):
+        raise InvalidBlock("the master block is not an object")
+    master, cert = block.get("ed25519"), block.get("cert")
+    if not is_key(master):
+        raise InvalidBlock("the master is not a key")
+    if not isinstance(cert, str) or len(cert) != SIG_LEN:
+        raise InvalidBlock("the certificate is not a signature")
+    return master, cert
 
 
 def sign_master(master: vz.Account, ver: int, devices: list[str]) -> dict:
@@ -168,12 +202,14 @@ class Change(Enum):
 
 @dataclass(frozen=True)
 class Device:
-    """A listed device whose id block verified under its master: the curve a
-    session was bound to, whether a pre-key message proved it, and when we
-    last heard from it."""
+    """A device whose id block verified under its master, listed or
+    certified: the curve a session was bound to, whether a pre-key message
+    proved it, whether its master's certificate was seen, and when we last
+    heard from it."""
     ed25519: str
     curve25519: str
-    proven: bool = False
+    proven: bool
+    certified: bool
     heard_at: float | None = None
 
 
@@ -210,24 +246,34 @@ class Book:
     def revoked(self, ed25519: str) -> bool:
         return ed25519 in self._ever and ed25519 not in self._listed
 
-    def bind(self, ident: dict, *, proven: bool) -> Device:
-        """Record the curve of a listed device whose id block verifies under
-        this master. ValueError otherwise, and for a curve other than the
-        one already bound. A proof, once recorded, stays."""
+    def bind(self, ident: dict, *, proven: bool, cert: str | None) -> Device:
+        """Record the curve of a device whose id block verifies under this
+        master and that is trusted: listed (`cert` None, the KEYS path), or
+        certified by `cert` (a pre-key message's), and never revoked here.
+        ValueError otherwise, and for a curve other than the one already
+        bound. A proof, and a certificate, once recorded, stay."""
         if not id_ok(ident, self.master):
             raise ValueError("the id block does not verify under this master")
         ed, curve = ident["ed25519"], ident["curve25519"]
-        if not self.listed(ed):
+        if self.revoked(ed):
+            raise ValueError("the device is revoked")
+        if cert is not None and not cert_ok(self.master, ed, cert):
+            raise ValueError("the certificate does not verify under this master")
+        certified = cert is not None
+        if not certified and not self.listed(ed):
             raise ValueError("the device is not listed")
         cur = self._devices.get(ed)
         if cur is None:
-            cur = Device(ed, curve, proven)
+            cur = Device(ed, curve, proven, certified)
         elif cur.curve25519 != curve:
             raise ValueError("the device is bound to another curve")
         else:
-            cur = replace(cur, proven=cur.proven or proven)
+            cur = replace(cur, proven=cur.proven or proven, certified=cur.certified or certified)
         self._devices[ed] = cur
         return cur
+
+    def _trusted(self, d: Device) -> bool:
+        return not self.revoked(d.ed25519) and (d.certified or self.listed(d.ed25519))
 
     def device(self, ed25519: str) -> Device | None:
         return self._devices.get(ed25519)
@@ -238,14 +284,14 @@ class Book:
             self._devices[ed25519] = replace(cur, heard_at=at)
 
     def targets(self) -> list[Device]:
-        """The listed devices with a curve, the most recently heard first:
+        """The trusted devices with a curve, the most recently heard first:
         the person typing gets the first copy. Never heard: in key order."""
-        live = [d for d in self._devices.values() if self.listed(d.ed25519)]
+        live = [d for d in self._devices.values() if self._trusted(d)]
         return sorted(live, key=lambda d: (d.heard_at is None, -(d.heard_at or 0.0), d.ed25519))
 
     def device_for_curve(self, curve25519: str) -> Device | None:
         return next((d for d in self._devices.values()
-                     if d.curve25519 == curve25519 and self.listed(d.ed25519)), None)
+                     if d.curve25519 == curve25519 and self._trusted(d)), None)
 
     def revoked_curve(self, curve25519: str) -> bool:
         return any(d.curve25519 == curve25519 and self.revoked(d.ed25519)
@@ -255,10 +301,11 @@ class Book:
         return {"master": self.master, "ver": self.ver,
                 "listed": sorted(self._listed), "ever": sorted(self._ever),
                 "devices": {ed: {"curve25519": d.curve25519, "proven": d.proven,
-                                 "heard_at": d.heard_at} for ed, d in self._devices.items()}}
+                                 "certified": d.certified, "heard_at": d.heard_at}
+                            for ed, d in self._devices.items()}}
 
     @classmethod
     def from_doc(cls, doc: dict) -> "Book":
         return cls(doc["master"], doc["ver"], frozenset(doc["listed"]), frozenset(doc["ever"]),
-                   {ed: Device(ed, d["curve25519"], d["proven"], d["heard_at"])
+                   {ed: Device(ed, d["curve25519"], d["proven"], d["certified"], d["heard_at"])
                     for ed, d in doc["devices"].items()})
