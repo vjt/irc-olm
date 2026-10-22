@@ -37,9 +37,9 @@ import vodozemac as vz
 
 from . import framing
 from .challenge import Challenge, ChallengeBook, new_challenge
-from .devices import (MAX_DEVICES, Book, Device, InvalidBlock, binding, did, id_block,
-                      parse_keys, parse_master, parse_master_ref, sign_cert, sign_master,
-                      wire_int)
+from .devices import (MAX_DEVICES, Book, Device, InvalidBlock, binding, cert_ok, did, id_block,
+                      id_ok, parse_keys, parse_master, parse_master_ref, sign_cert,
+                      sign_master, wire_int)
 from .framing import PayloadError, fold
 from .keys import b64, ed25519_key, is_key, sig_ok, unb64
 from .reassembly import Assembled, Reassembler, Rejected
@@ -795,7 +795,7 @@ class Engine:
         body = self._own_body(nick, msg, payload, res)
         if body is None:
             return
-        peer = self._master_peer(nick, master, "PKMSG", res)
+        peer = self._master_peer(nick, ident, master, cert, res)
         if peer is None:
             return
         book = self._book(master)
@@ -1107,17 +1107,20 @@ class Engine:
 
     # --- identities and pins -------------------------------------------------
 
-    def _master_peer(self, nick: str, master: str, verb: str, res: Result) -> Peer | None:
-        """The pinned peer a master block names, under any nick. Otherwise
+    def _master_peer(self, nick: str, ident: dict, master: str, cert: str,
+                     res: Result) -> Peer | None:
+        """The pinned peer a PKMSG's master names, under any nick. Otherwise
         None: ignored, never answered, and a KeyAlarm when `nick` is pinned
-        to another master."""
+        to another master and the id block and certificate verify under the
+        one presented. Junk next to a master key is anyone's to type, and an
+        alarm for it would cry wolf."""
         peer = self._peers.get(master)
         if peer is not None:
             return peer
         pinned = self._pins.get(fold(nick))
-        if pinned:
+        if pinned and id_ok(ident, master) and cert_ok(master, ident["ed25519"], cert):
             res.events.append(KeyAlarm(nick, pinned, master))
-        res.events.append(Dropped(nick, "unpinned-key", verb))
+        res.events.append(Dropped(nick, "unpinned-key", "PKMSG"))
         return None
 
     def _book(self, master: str) -> Book:

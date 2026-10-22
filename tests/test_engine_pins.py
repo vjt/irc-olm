@@ -2,7 +2,7 @@ import pytest
 
 from conftest import keys_payload
 from irc_olm import framing
-from irc_olm.devices import id_text
+from irc_olm.devices import did, id_text
 from irc_olm.engine import Dropped, KeyAlarm, Received, SendFailed
 
 
@@ -54,6 +54,25 @@ def test_a_pkmsg_from_an_unpinned_master_keeps_nothing_whatever_its_body(net, bo
     res = net.inject("vjt", "bot", "PKMSG", pk, frm=eve.did)     # eve on vjt's nick
     assert [e.presented for e in res.events if isinstance(e, KeyAlarm)] == [eve.fingerprint]
     assert eve.fingerprint not in bot._books and res.outbound == []
+
+
+@pytest.mark.parametrize("forged", ["id-signature", "certificate", "id-of-another-master"])
+def test_a_pkmsg_that_fails_its_own_signatures_is_no_alarm(net, forged):
+    # Anyone can type a master key next to junk: an alarm is for a block that
+    # holds together under the master it presents.
+    bot, vjt, eve, mallory = net.add("bot"), net.add("vjt"), net.add("eve"), net.add("mallory")
+    net.pair("bot", "vjt")
+    ident, ref = dict(eve.identity), dict(eve.master_ref)
+    if forged == "id-signature":
+        ident["sig"] = mallory.identity["sig"]
+    elif forged == "certificate":
+        ref["cert"] = mallory.master_ref["cert"]
+    else:
+        ident = mallory.identity
+    pk = {"v": 2, "id": ident, "master": ref, "bodies": {bot.did: "AAAA"}}
+    res = net.inject("vjt", "bot", "PKMSG", pk, frm=did(ident["ed25519"]))
+    assert [type(e).__name__ for e in res.events] == ["Dropped"]
+    assert [e.reason for e in res.events] == ["unpinned-key"] and res.outbound == []
 
 
 def test_send_to_an_unpinned_nick_fails(net):
