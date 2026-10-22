@@ -284,7 +284,8 @@ class Engine:
         self._keyreq_at: dict[str, float] = {}       # folded nick -> last KEYREQ
         self._keyreq_out: set[str] = set()           # folded nicks a KEYS is due from
         self._keys_at: dict[str, float] = {}         # folded nick -> last KEYS answer
-        self._rekey_at: dict[str, float] = {}        # folded nick -> last session opened
+        self._rekey_at: dict[str, float] = {}        # folded nick -> last re-key or session opened
+        self._rekey_due: dict[str, str] = {}         # folded nick -> nick: a re-key's KEYREQ waits
         self._rekeying: set[str] = set()             # device keys waiting for fresh keys
         self._listreq_at: dict[str, float] = {}      # folded nick -> last listreq sent
         self._listreq_lv: dict[str, set[int]] = {}   # folded nick -> the lvs asked for
@@ -508,6 +509,7 @@ class Engine:
             return
         self._keyreq_at[key] = self._now()
         self._keyreq_out.add(key)
+        self._rekey_due.pop(key, None)
         self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res, to=framing.ANY, urgent=True)
 
     def _encrypt(self, nick: str, peer: Peer, msg: _Outgoing, ready: list[Device],
@@ -1029,16 +1031,18 @@ class Engine:
             # The failed session is not our newest: re-send on the newest.
             self._drop_session(d.curve25519, session_id)
             return self._send_to(nick, peer, again, res, want=only)
-        if key not in self._keyreq_out:
+        if key not in self._keyreq_out and key not in self._rekey_due:
             # The failed session is our newest: only a new one helps, and the
             # spec allows one re-key per nick per minute, however many of its
-            # devices NACKed. With keys already asked for, this one joins.
+            # devices NACKed: a NACK while one is under way joins it. Its
+            # KEYREQ keeps to the one budget, one per nick per 30 s: it goes
+            # now, or when tick() finds it due.
             last = self._rekey_at.get(key)
             if last is not None and self._now() - last < REKEY_INTERVAL:
                 self._lost(nick, "rekey-throttled", [sent.msg], res)
                 return
             res.events.append(Rekeying(nick, peer, ed))
-            self._keyreq_at.pop(key, None)      # its KEYREQ goes now: the minute bounds it
+            self._rekey_at[key], self._rekey_due[key] = self._now(), nick
         self._drop_session(d.curve25519, session_id)
         self._rekeying.add(ed)
         # Re-send the lost message on the new session (the spec's MAY), to
@@ -1090,8 +1094,9 @@ class Engine:
 
     def tick(self) -> Result:
         """Expire unanswered challenges and queued messages that waited too
-        long for keys, forget old plaintexts, rotate the fallback key when it
-        is due. Call about once a second."""
+        long for keys, send the KEYREQ of a re-key once the budget allows,
+        forget old plaintexts, rotate the fallback key when it is due. Call
+        about once a second."""
         with self._lock:
             res = Result()
             now = self._now()
@@ -1099,6 +1104,11 @@ class Engine:
                 res.events.append(ChallengeExpired(ch))
             for key in list(self._outq):
                 self._live_queue(key, res)
+            for key, nick in list(self._rekey_due.items()):
+                if self.pinned(nick) is None:
+                    del self._rekey_due[key]
+                else:
+                    self._maybe_keyreq(nick, res)
             self._trim_sent()
             if now - self._fallback["at"] >= FALLBACK_ROTATE:
                 self._new_fallback_key()

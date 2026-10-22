@@ -276,3 +276,58 @@ def test_more_trusted_devices_than_a_message_holds_go_in_two_messages(net):
     assert sorted(map(len, groups[:2])) == [1, MAX_DEVICES]
     assert set().union(*groups[:2]) == {d.did for d in devs}
     assert net.take("bot", SendFailed) == []
+
+
+def held(net, n, verb, src=None):
+    """The `verb` lines alice's side put on the wire since `n`, from the
+    device address `src` if given: what net.drop held back is there too."""
+    return [b for s, _, b in net.wire[n:] if s == "alice" and framing.parse(b).verb == verb
+            and src in (None, framing.parse(b).src)]
+
+
+def test_a_rekey_inside_the_keyreq_budget_waits_for_it_and_later_nacks_join(net):
+    from irc_olm.engine import KEYREQ_RETRY, REKEY_INTERVAL
+    bot, (a0, a1, a2) = setup(net, 3)
+    net.no_keys = {a1.device_key}                 # every send asks for a1's keys
+    net.pump("bot", bot.send("alice", text("one")))       # a KEYREQ at t=0
+    net.clock.t += REKEY_INTERVAL + 1
+    a0.forget_sessions(bot.fingerprint)           # two devices restored old backups
+    a2.forget_sessions(bot.fingerprint)
+    n = len(net.wire)
+    net.drop = lambda src, dst, body: src == "alice"      # alice's side answers late
+    net.pump("bot", bot.send("alice", text("two")))       # a KEYREQ at t=61
+    net.drop = None
+    for line in held(net, n, "KEYS"):             # a0 and a2 still look fine: opens nothing
+        bot.receive("alice", line)
+    nacks = held(net, n, "NACK")                  # a0's, then a2's
+    net.clock.t += 1
+    first = bot.receive("alice", nacks[0])
+    assert [e.device for e in first.events if isinstance(e, Rekeying)] == [a0.device_key]
+    assert first.outbound == []                   # one KEYREQ per nick per 30 s
+    net.clock.t += 1
+    second = bot.receive("alice", nacks[1])       # joins the re-key under way
+    assert not [e for e in second.events if isinstance(e, (Rekeying, SendFailed))]
+    assert second.outbound == []
+    net.clock.t += KEYREQ_RETRY - 2
+    net.pump("bot", bot.tick())                   # t=91: due, and asked
+    assert [texts(net.take(f"alice.{i}"))[-1:] for i in (0, 2)] == [["two"], ["two"]]
+    assert net.take("bot", SendFailed) == []
+
+
+def test_a_rekey_whose_keys_open_nothing_still_counts_for_the_minute(net):
+    from irc_olm.engine import REKEY_INTERVAL
+    bot, (a0, a1) = setup(net)
+    net.pump("bot", bot.send("alice", text("one")))
+    net.clock.t += REKEY_INTERVAL + 1
+    a0.forget_sessions(bot.fingerprint)
+    a1.forget_sessions(bot.fingerprint)
+    net.no_keys = {a0.device_key, a1.device_key}  # and their grappa holds no keys
+    n, a1_did = len(net.wire), a1.did
+    net.drop = lambda src, dst, body: src == "alice" and framing.parse(body).src == a1_did
+    net.pump("bot", bot.send("alice", text("two")))       # a0's NACK: a re-key, for nothing
+    net.drop = None
+    assert [e.device for e in net.take("bot", Rekeying)] == [a0.device_key]
+    net.clock.t += 10
+    late = bot.receive("alice", held(net, n, "NACK", a1_did)[0])
+    assert [e.reason for e in late.events if isinstance(e, SendFailed)] == ["rekey-throttled"]
+    assert not [e for e in late.events if isinstance(e, Rekeying)] and late.outbound == []

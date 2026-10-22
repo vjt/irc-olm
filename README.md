@@ -123,7 +123,8 @@ else:
     report_lost("vjt")
 
 # About once a second: expires unanswered challenges, reports (SendFailed)
-# messages that waited too long for keys, rotates the fallback key weekly.
+# messages that waited too long for keys, sends a re-key's KEYREQ when the
+# budget allows, rotates the fallback key weekly.
 dispatch(engine.tick())
 ```
 
@@ -219,10 +220,12 @@ of `repr()`, but log lengths, never bodies.
   on a line would answer nicks no pinned key ever used. A NACK names the
   device that failed in its `from`, and only a device the message went to may
   NACK it. A NACKed message is re-sent once, to that device alone, on a newer
-  session when there is one, otherwise on a new one (at most one re-key per
-  nick per minute, however many of its devices NACKed). Messages sent while keys are being asked
-  for wait for the new session instead of going out on the session that just
-  failed. A NACK from a nick the message was not sent to re-sends nothing (it
+  session when there is one, otherwise on a new one: at most one re-key per
+  nick per minute, however many of its devices NACKed (a NACK while one is
+  under way joins it), and its KEYREQ keeps to the budget of one per nick per
+  30 s, sent by `tick()` when it falls due. Messages sent while keys are being
+  asked for wait for the new session instead of going out on the session that
+  just failed. A NACK from a nick the message was not sent to re-sends nothing (it
   is not authenticated) and is reported as a loss.
 - **Device lists inside Olm.** Every inner message carries `lv`, the version
   of the list its sender's device holds. One above the version we hold makes
