@@ -69,6 +69,22 @@ def test_a_listreq_goes_once_per_lv_and_once_per_nick_a_minute(net):
     assert listreqs(a0, "lv 3 again") == 0
 
 
+def test_a_huge_lv_from_one_device_silences_no_later_listreq(net):
+    from irc_olm.engine import LISTREQ_INTERVAL
+    bot, (a0, a1, a2) = setup(net, 3)
+    net.pump("bot", bot.send("alice", text("hi")))
+
+    def listreqs(dev, body):
+        return len(olm_msgids(feed(bot, "alice", dev.send("bot", text(body)))))
+
+    a1._ver = 2**31 - 1                          # broken, or stolen
+    assert listreqs(a1, "lv max") == 1
+    a1._ver = 1
+    net.clock.t += LISTREQ_INTERVAL
+    net.relist("alice", [a0, a2], 2)             # its owner revokes it
+    assert listreqs(a0, "I revoked a1") == 1
+
+
 def test_a_listreq_is_answered_once_per_device_a_minute(net):
     from irc_olm.engine import LISTREQ_INTERVAL
     bot, (a0, a1) = setup(net, 2)

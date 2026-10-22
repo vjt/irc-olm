@@ -287,7 +287,7 @@ class Engine:
         self._rekey_at: dict[str, float] = {}        # folded nick -> last session opened
         self._rekeying: set[str] = set()             # device keys waiting for fresh keys
         self._listreq_at: dict[str, float] = {}      # folded nick -> last listreq sent
-        self._listreq_lv: dict[str, int] = {}        # folded nick -> highest lv asked for
+        self._listreq_lv: dict[str, set[int]] = {}   # folded nick -> the lvs asked for
         self._listed_at: dict[tuple[str, str], float] = {}  # (nick, device) -> list sent
         self._otk_at: dict[str, float] = {}          # folded nick -> last OTK handed out
         self._otk_log: list[float] = []
@@ -972,13 +972,16 @@ class Engine:
 
     def _maybe_listreq(self, nick: str, peer: Peer, d: Device, lv: int, res: Result) -> None:
         """The device holds a newer list than ours (its `lv`): ask it, once
-        per (nick, lv) and once per nick a minute."""
+        per (nick, lv) and once per nick a minute. An lv asked for is
+        remembered until we store a list as new: never a high-water mark,
+        or one device announcing a huge lv silences every other."""
         key, now = fold(nick), self._now()
-        last = self._listreq_at.get(key)
-        if lv <= self._listreq_lv.get(key, 0) or (
-                last is not None and now - last < LISTREQ_INTERVAL):
+        ver, last = self._books[peer.master].ver, self._listreq_at.get(key)
+        asked = self._listreq_lv[key] = {v for v in self._listreq_lv.get(key, ()) if v > ver}
+        if lv in asked or (last is not None and now - last < LISTREQ_INTERVAL):
             return
-        self._listreq_lv[key], self._listreq_at[key] = lv, now
+        asked.add(lv)
+        self._listreq_at[key] = now
         self._send_reactive(nick, peer, d, {"t": "listreq"}, res)
 
     def _send_reactive(self, nick: str, peer: Peer, d: Device, inner: dict,
