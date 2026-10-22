@@ -2,6 +2,7 @@ import base64
 
 import pytest
 
+from conftest import body as body_of, keys_payload, msg, pkmsg
 from irc_olm import framing
 from irc_olm.engine import Dropped, Received, Replayed, SendQueued, Undecryptable
 
@@ -26,9 +27,12 @@ def test_first_contact_keyreq_keys_pkmsg_then_reply_as_msg(net):
     assert texts(net.take("bot")) == ["ciao bot"]
     assert verbs(net) == ["KEYREQ", "KEYS", "PKMSG"]
 
+    # The reply goes at once, on the session vjt's PKMSG opened; and since
+    # the bot holds no list for vjt yet (a PKMSG carries a certificate, not
+    # the list), it asks for one.
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "ciao vjt"}))
     assert texts(net.take("vjt")) == ["ciao vjt"]
-    assert verbs(net)[-1] == "MSG"
+    assert verbs(net)[3:] == ["MSG", "KEYREQ", "KEYS"]
 
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "now MSG too"}))
     assert texts(net.take("bot")) == ["now MSG too"]
@@ -60,16 +64,24 @@ def test_payloads_match_the_wire_spec(net):
     bot, vjt = paired(net)
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "x"}))
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "y"}))
-    by_verb = {verb: payload for _, verb, payload in net.messages()}
-    assert by_verb["KEYREQ"] == {"v": 1}
+    by_verb = {}
+    for _, verb, payload in net.messages():
+        by_verb.setdefault(verb, payload)
+    assert by_verb["KEYREQ"] == {"v": 2}
     keys = by_verb["KEYS"]
-    assert keys["v"] == 1 and set(keys["id"]) == {"curve25519", "ed25519", "sig"}
-    assert set(keys["otk"]) == {"key", "fallback", "sig"} and keys["otk"]["fallback"] is False
-    assert keys["id"] == bot.identity
-    assert set(by_verb["PKMSG"]) == {"v", "id", "body"} and by_verb["PKMSG"]["id"] == vjt.identity
-    assert set(by_verb["MSG"]) == {"v", "ck", "body"}
+    assert set(keys) == {"v", "master", "devices"} and keys["v"] == 2
+    assert keys["master"] == bot.master_block
+    assert keys["master"]["list"] == {"ver": 1, "devices": [bot.device_key]}
+    (entry,) = keys["devices"]
+    assert entry["id"] == bot.identity and set(entry["id"]) == {"curve25519", "ed25519", "sig"}
+    assert set(entry["otk"]) == {"key", "fallback", "sig"} and entry["otk"]["fallback"] is False
+    pk = by_verb["PKMSG"]
+    assert set(pk) == {"v", "id", "master", "bodies"} and pk["id"] == vjt.identity
+    assert pk["master"] == {"ed25519": vjt.fingerprint, "cert": pk["master"]["cert"]}
+    assert set(pk["bodies"]) == {bot.did}
+    assert set(by_verb["MSG"]) == {"v", "ck", "bodies"} and set(by_verb["MSG"]["bodies"]) == {vjt.did}
     assert by_verb["MSG"]["ck"] == bot.identity["curve25519"]
-    for value in (keys["id"]["sig"], keys["otk"]["key"], by_verb["MSG"]["body"]):
+    for value in (entry["id"]["sig"], entry["otk"]["key"], body_of(by_verb["MSG"], vjt)):
         assert "=" not in value  # unpadded base64
 
 
@@ -114,7 +126,8 @@ def test_state_file_carries_the_public_identity_in_clear(net):
     import json
     bot = net.add("bot")
     doc = json.loads(bot.state_path.read_text())
-    assert doc["identity"] == {"ed25519": bot.fingerprint, "curve25519": bot.identity["curve25519"]}
+    assert doc["identity"] == {"master": bot.fingerprint, "ed25519": bot.device_key,
+                               "curve25519": bot.identity["curve25519"]}
     assert "pins" not in doc   # the configuration is the source of truth, never the state
 
 
@@ -139,7 +152,7 @@ def test_replayed_fallback_prekey_message_is_never_decrypted(net):
     assert texts(net.take("bot")) == ["order 66", "ping"]
     pkmsg = [(s, b) for s, _, b in net.wire if framing.parse(b).verb == "PKMSG"]
     keys = [p for _, verb, p in net.messages() if verb == "KEYS"]
-    assert [k["otk"]["fallback"] for k in keys] == [False, True]
+    assert [k["devices"][0]["otk"]["fallback"] for k in keys] == [False, True]
     # The bot loses its session (as after a NACK), then the PKMSG is replayed.
     bot.forget_sessions(vjt.fingerprint)
     for s, b in pkmsg:
@@ -155,12 +168,12 @@ def test_undecryptable_message_triggers_a_nack(net):
     # Garble one: same session, broken MAC.
     frags = [framing.parse(b) for _, b in vjt.send("bot", {"t": "text", "body": "c"}).outbound]
     p = framing.decode_payload("".join(f.chunk for f in frags))
-    raw = bytearray(base64.b64decode(p["body"] + "=" * (-len(p["body"]) % 4)))
+    raw = bytearray(base64.b64decode(body_of(p, bot) + "=" * (-len(body_of(p, bot)) % 4)))
     raw[-1] ^= 1
-    p["body"] = base64.b64encode(bytes(raw)).decode().rstrip("=")
-    for body in framing.fragment(frags[0].verb, framing.encode_payload(p), src=frags[0].src,
+    p["bodies"][bot.did] = base64.b64encode(bytes(raw)).decode().rstrip("=")
+    for line in framing.fragment(frags[0].verb, framing.encode_payload(p), src=frags[0].src,
                                  dst=frags[0].dst, own_mask="vjt!x@y", target="bot"):
-        res = bot.receive("vjt", body)
+        res = bot.receive("vjt", line)
     assert any(isinstance(e, Undecryptable) for e in res.events)
     assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]
 
@@ -183,9 +196,10 @@ def test_received_event_repr_never_shows_plaintext(net):
 
 
 @pytest.mark.parametrize("payload", [
-    {"v": 1},                                         # KEYS without id/otk
-    {"v": 1, "id": "not-a-dict", "otk": {}},
-    {"v": 1, "id": {"ed25519": "x", "curve25519": "y", "sig": "z"}, "otk": {"key": 1}},
+    {"v": 2},                                         # KEYS without master/devices
+    {"v": 2, "id": "not-a-dict", "master": {}, "devices": [{}], "bodies": [], "ck": 1},
+    {"v": 2, "id": {"ed25519": "x", "curve25519": "y", "sig": "z"}, "otk": {"key": 1},
+     "devices": "x", "bodies": {"x": 1}},
 ])
 def test_malformed_payloads_are_dropped_not_raised(net, payload):
     bot, vjt = paired(net)
@@ -206,8 +220,8 @@ def test_a_deeply_nested_payload_is_dropped_not_raised(net):
     bot, vjt = paired(net)
     # A NACK whose ref is the nesting: undecodable where the scanner
     # recurses (< 3.12), an unhashable ref where it does not. Dropped both ways.
-    body = '{"v":1,"ref":' + DEEP + "}"
-    for frag in framing.fragment("NACK", body, src=vjt.did, dst=bot.did, own_mask="vjt!x@h",
+    deep = '{"v":2,"ref":' + DEEP + "}"
+    for frag in framing.fragment("NACK", deep, src=vjt.did, dst=bot.did, own_mask="vjt!x@h",
                                  target="bot"):
         res = bot.receive("vjt", frag)
     assert all(isinstance(e, Dropped) for e in res.events)
@@ -221,8 +235,7 @@ def test_a_deeply_nested_inner_message_is_dropped_not_raised(net):
     net.take("bot")
     session = vjt._sessions[bot.identity["curve25519"]][0]
     _, ct = session.encrypt(('{"t":"text","body":"x","deep":' + DEEP + "}").encode()).to_parts()
-    res = net.inject("vjt", "bot", "MSG", {"v": 1, "ck": vjt.identity["curve25519"],
-                                           "body": base64.b64encode(ct).decode().rstrip("=")})
+    res = net.inject("vjt", "bot", "MSG", msg(vjt, bot, ct))
     # Delivered where the scanner does not recurse (>= 3.12), dropped where it does.
     if texts(res.events) != ["x"]:
         assert texts(res.events) == []
@@ -239,15 +252,15 @@ def test_an_inner_message_json_cannot_spell_is_dropped(net, constant):
     net.take("bot")
     session = vjt._sessions[bot.identity["curve25519"]][0]
     _, ct = session.encrypt(('{"t":"text","body":"x","n":' + constant + "}").encode()).to_parts()
-    res = net.inject("vjt", "bot", "MSG", {"v": 1, "ck": vjt.identity["curve25519"],
-                                           "body": base64.b64encode(ct).decode().rstrip("=")})
+    res = net.inject("vjt", "bot", "MSG", msg(vjt, bot, ct))
     assert texts(res.events) == []
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["undecodable-inner"]
 
 
 def test_a_body_that_is_not_base64_is_dropped_not_raised(net):
     bot, vjt = paired(net)
-    res = net.inject("bot", "vjt", "PKMSG", {"v": 1, "id": bot.identity, "body": "!!!"})
+    res = net.inject("bot", "vjt", "PKMSG", {"v": 2, "id": bot.identity, "master": bot.master_ref,
+                                             "bodies": {vjt.did: "!!!"}})
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-payload:Error"]
 
 
@@ -279,26 +292,25 @@ def test_keyreq_answers_are_rate_limited_per_nick(net):
     # A KEYS is two lines, 8 s of our flood bank.
     from irc_olm.engine import KEYS_INTERVAL
     bot, vjt = paired(net)
-    first = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+    first = net.inject("vjt", "bot", "KEYREQ", {"v": 2})
     net.clock.t += KEYS_INTERVAL - 1
-    second = net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+    second = net.inject("vjt", "bot", "KEYREQ", {"v": 2})
     assert {framing.parse(b).verb for _, b in first.outbound} == {"KEYS"}
     assert second.outbound == []
     assert [e.reason for e in second.events if isinstance(e, Dropped)] == ["keyreq-rate-limited"]
     net.clock.t += 1
-    assert net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound
+    assert net.inject("vjt", "bot", "KEYREQ", {"v": 2}).outbound
 
 
 def test_a_keys_answer_with_a_forged_one_time_key_signature_is_dropped(net):
     import vodozemac as vz
     bot, vjt = paired(net)
     vjt.send("bot", {"t": "text", "body": "queued"})
-    keys = framing.decode_payload("".join(
-        framing.parse(b).chunk for _, b in net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound))
-    keys["otk"]["key"] = vz.Account().curve25519_key.to_base64()   # sig no longer covers it
+    keys = keys_payload(net, "bot", "vjt")
+    keys["devices"][0]["otk"]["key"] = vz.Account().curve25519_key.to_base64()  # sig no longer covers it
     res = net.inject("bot", "vjt", "KEYS", keys)
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-otk-signature"]
-    assert res.outbound == [] and vjt.peers()[0].curve25519 is None
+    assert res.outbound == [] and vjt.devices(bot.fingerprint) == []
 
 
 def test_queued_messages_that_expire_are_reported_lost(net):
@@ -316,10 +328,10 @@ def test_the_fallback_key_rotates_weekly(net):
     from irc_olm.engine import FALLBACK_ROTATE, KEYS_INTERVAL
 
     def fallback_after_two_keyreqs():
-        net.inject("vjt", "bot", "KEYREQ", {"v": 1})
+        net.inject("vjt", "bot", "KEYREQ", {"v": 2})
         net.clock.t += KEYS_INTERVAL     # inside the minute: the fallback key
         (k,) = [framing.decode_payload("".join(framing.parse(b).chunk for _, b in
-                net.inject("vjt", "bot", "KEYREQ", {"v": 1}).outbound))["otk"]]
+                net.inject("vjt", "bot", "KEYREQ", {"v": 2}).outbound))["devices"][0]["otk"]]
         assert k["fallback"] is True
         return k["key"]
 
@@ -391,13 +403,12 @@ def test_a_message_too_long_leaves_the_olm_chain_where_it_was(net):
 
 def test_a_first_pkmsg_that_opens_no_session_gets_a_nack(net):
     import vodozemac as vz
-    from irc_olm.engine import b64
     bot, vjt = paired(net)
     # vjt's first message, on a one-time key the bot never published
     junk = vz.Account().curve25519_key
     session = vjt._account.create_outbound_session(bot._account.curve25519_key, junk)
     _, ct = session.encrypt(b'{"t":"text","body":"x"}').to_parts()
-    res = net.inject("vjt", "bot", "PKMSG", {"v": 1, "id": vjt.identity, "body": b64(ct)})
+    res = net.inject("vjt", "bot", "PKMSG", pkmsg(vjt, bot, ct))
     assert [e.reason.split(":")[0] for e in res.events if isinstance(e, Undecryptable)] == \
         ["session-creation"]
     assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]
@@ -410,8 +421,8 @@ def test_keys_with_a_signed_but_unusable_one_time_key_keep_the_queue(net, raw):
     bot.send("vjt", {"t": "text", "body": "waits"})
     otk = base64.b64encode(raw).decode().rstrip("=")
     res = net.inject("vjt", "bot", "KEYS", {
-        "v": 1, "id": vjt.identity,
-        "otk": {"key": otk, "fallback": True, "sig": vjt._sign(OTK_SIG_PREFIX + otk)}})
+        "v": 2, "master": vjt.master_block, "devices": [{"id": vjt.identity, "otk": {
+            "key": otk, "fallback": True, "sig": vjt._sign(OTK_SIG_PREFIX + otk)}}]})
     assert [e for e in res.events if isinstance(e, Dropped)]
     net.clock.t += OUTQ_TTL + 1
     assert [(e.reason, e.lost) for e in bot.tick().events if isinstance(e, SendFailed)] == \
@@ -529,9 +540,9 @@ def test_messages_the_pacer_refused_are_forgotten(net):
     bot, vjt = paired(net)
     net.pump("vjt", vjt.send("bot", {"t": "text", "body": "hi"}))
     sent = bot.send("vjt", {"t": "text", "body": "refused"})
-    (msgid,) = {framing.parse(b).msgid for _, b in sent.outbound}
+    (msgid,) = {f.msgid for f in map(framing.parse, (b for _, b in sent.outbound)) if f.verb == "MSG"}
     bot.discard([msgid])
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": msgid})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": msgid})
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
     assert res.outbound == []
 
@@ -544,7 +555,7 @@ def test_a_message_evicted_by_the_global_reassembly_cap_is_reported(net):
     bot._reasm = Reassembler(max_bytes_total=1500, clock=net.clock)
 
     def frags(size):
-        return framing.fragment("MSG", framing.encode_payload({"v": 1, "body": "x" * size}),
+        return framing.fragment("MSG", framing.encode_payload({"v": 2, "body": "x" * size}),
                                 src="Str4nger-__", dst=bot.did, own_mask="x!x@h", target="bot")
     big = frags(900)
     assert len(big) == 3

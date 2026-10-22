@@ -38,22 +38,27 @@ new key in again.
 
 A bot talks E2E only to the keys its operator pinned (vjt's ruling on
 grappa-irc#2430). There is no trust-on-first-use and no SAS on a bot. The pins
-file has one `<nick> <ed25519>` per line, and the key is the peer's Ed25519 key
-exactly as it shows it (unpadded base64, 43 chars). An unknown key gets
-silence: no KEYS, no NACK, no session. Rotation means re-pasting the key and
-reloading (`Engine.set_pins`).
+file has one `<nick> <ed25519>` per line, and the key is the peer's **master
+key** exactly as it shows it (unpadded base64, 43 chars): wire v2 gives every
+user one master Ed25519 key per network, which signs the list of its devices
+(1 to 4) and a certificate for each, so one pin covers every device the master
+lists, now and later. An unknown master gets silence: no KEYS, no NACK, no
+session. Rotation means re-pasting the key and reloading (`Engine.set_pins`).
+A wire v1 state file is refused: wire v2 is a new identity, so move the old
+file away and re-pin on both sides (flag-day).
 
 The bot only reads the pins file. **It must not be writable by the bot's own
 Claude session**: the operator makes it root-owned in a root-owned directory,
 or denies it in that session's permission rules. `pins_writable()` lets the
 bot warn when it is not.
 
-To print the bot's own key for pasting into the other side (cicchetto's
-manual pin):
+To print the bot's own master key for pasting into the other side
+(cicchetto's manual pin, another bot's pins file):
 
     python -m irc_olm identity --state azzurra.state.json
 
-There is one identity, and so one state file and one key, per network. The state
+There is one identity (a master key and one Olm device under it), and so one
+state file and one key, per network. The state
 file is replaced atomically on every change, at mode 600. A state file or key
 that group or others can read is refused, the way ssh refuses a private key.
 
@@ -162,10 +167,21 @@ of `repr()`, but log lengths, never bodies.
 
 ## Security notes
 
-- **Pins are on keys, never on nicks.** A pinned key is accepted under any
-  nick. A different key on a pinned nick raises `KeyAlarm` for the log and is
-  ignored. Nothing queued for a key is ever sent to another key, including
-  one the operator pasted in its place.
+- **Pins are on master keys, never on nicks.** A pinned master is accepted
+  under any nick. A different master on a pinned nick raises `KeyAlarm` for
+  the log and is ignored, and so does a KEYS that describes any master other
+  than the one asked at that nick. Nothing queued for a master is ever sent
+  to another, including one the operator pasted in its place.
+- **Devices.** A peer's device is trusted when its id block, signed by the
+  device, covers its curve and its master (so no other master can claim it),
+  and when the master lists it (KEYS) or certified it (a PKMSG, before the
+  list says so) and never dropped it from a list we accepted. A list only
+  moves forward (a higher `ver`); a device a newer list drops is revoked for
+  good: its sessions go, nothing is encrypted to it again, and its lines are
+  dropped without a NACK. That memory survives a restart and a re-pin.
+  `Received.device` names the device a message came from, and a message to a
+  peer is one Olm message per nick with one body for each of its trusted
+  devices (`engine.devices(master)`).
 - **Nothing moves before a session proves it.** An id block is public and
   replayable, and its signature only says the Ed25519 key claims that
   curve25519 key. A peer's curve is stored only once a session exists, and the
@@ -175,19 +191,19 @@ of `repr()`, but log lengths, never bodies.
   and takes it from a key that only claimed it. One curve belongs to one
   pinned key; a second key claiming a proven curve is refused, and nobody may
   claim ours. A nick hint names one
-  key: the last one that spoke from it. Keys are compared in vodozemac's one
-  spelling.
-- **Known limit (unknown key-share).** The inner message does not name the
-  sender's and recipient's Ed25519 keys (Matrix puts both inside). Two windows
-  stay open, both needing a malicious pinned key. It can capture another
-  pinned peer's very first pre-key message off the network and get it
-  attributed to itself. Or, when that peer pins it too, it can claim the
-  peer's curve, hand us the peer's one-time key and relay: the peer's messages
-  on that session then decrypt as the relayer's until the peer opens a session
-  of its own. Neither reads anything it could not read already. Check that a
-  `Received` comes from the key pinned to its nick (claude-ircbot drops it
-  otherwise). Closing both needs both keys in the inner payload, a wire change
-  for both implementations.
+  master: the last one that spoke from it. Keys are compared as exact strings,
+  in vodozemac's one spelling: a key in any other spelling is malformed.
+- **Unknown key-share, closed (wire v2).** v1 left two windows to a malicious
+  pinned key: getting another peer's first pre-key message attributed to
+  itself, and relaying a session it opened on that peer's curve and one-time
+  key. Both close now. The id block's signature covers the master, so a
+  pre-key message is attributed to its own master or to nobody. And the inner
+  message of every pre-key body carries `fb`, a hash binding the sender's and
+  the recipient's device keys: a body built for one device and delivered to
+  another is `inner-key-mismatch`, and its session is discarded. A pinned
+  master is still accepted under any nick, so check that a `Received` comes
+  from the master pinned to its nick before acting on an order
+  (claude-ircbot drops it otherwise).
 - **Replays.** A pre-key message built on the fallback key can be replayed and
   would decrypt the old plaintext again. Seen session ids are persisted, and a
   replayed one is never decrypted. The fallback key also rotates weekly, and
@@ -195,9 +211,11 @@ of `repr()`, but log lengths, never bodies.
 - **Recovery.** Every message that does not decrypt gets its own NACK, but
   only when its sender's nick is where the key it claims is reached: a pinned
   key's curve and id block are public, and a NACK to every nick that puts them
-  on a line would answer nicks no pinned key ever used. A NACKed message is
-  re-sent once, on a newer session when there is one, otherwise on a new one
-  (at most one per peer per minute). Messages sent while keys are being asked
+  on a line would answer nicks no pinned key ever used. A NACK names the
+  device that failed in its `from`, and only a device the message went to may
+  NACK it. A NACKed message is re-sent once, to that device alone, on a newer
+  session when there is one, otherwise on a new one (at most one re-key per
+  nick per minute, however many of its devices NACKed). Messages sent while keys are being asked
   for wait for the new session instead of going out on the session that just
   failed. A NACK from a nick the message was not sent to re-sends nothing (it
   is not authenticated) and is reported as a loss.

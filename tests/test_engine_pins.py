@@ -1,11 +1,20 @@
 import pytest
 
+from conftest import keys_payload
 from irc_olm import framing
+from irc_olm.devices import id_text
 from irc_olm.engine import Dropped, KeyAlarm, Received, SendFailed
 
 
 def texts(events):
     return [e.inner["body"] for e in events if isinstance(e, Received)]
+
+
+def bound(engine, other):
+    """The curve `engine` bound to `other`'s device, or None."""
+    book = engine._books.get(other.fingerprint)
+    d = book and book.device(other.device_key)
+    return d.curve25519 if d else None
 
 
 def chat(net, a, b, text):
@@ -37,6 +46,16 @@ def test_unpinned_key_presenting_a_pkmsg_gets_silence(net):
     assert [v for _, v, _ in net.messages("bot")] == ["KEYS"]
 
 
+@pytest.mark.parametrize("body", ["", "AAAA"])
+def test_a_pkmsg_from_an_unpinned_master_keeps_nothing_whatever_its_body(net, body):
+    bot, vjt, eve = net.add("bot"), net.add("vjt"), net.add("eve")
+    net.pair("bot", "vjt")
+    pk = {"v": 2, "id": eve.identity, "master": eve.master_ref, "bodies": {bot.did: body}}
+    res = net.inject("vjt", "bot", "PKMSG", pk, frm=eve.did)     # eve on vjt's nick
+    assert [e.presented for e in res.events if isinstance(e, KeyAlarm)] == [eve.fingerprint]
+    assert eve.fingerprint not in bot._books and res.outbound == []
+
+
 def test_send_to_an_unpinned_nick_fails(net):
     bot = net.add("bot")
     res = bot.send("stranger", {"t": "text", "body": "x"})
@@ -53,7 +72,7 @@ def test_pinned_key_is_accepted_under_another_nick_and_replies_follow(net):
     net.events["vjt_"] = []
     chat(net, "vjt_", "bot", "renamed")
     assert texts(net.take("bot")) == ["renamed"]
-    assert bot.pinned("vjt_").ed25519 == vjt.fingerprint
+    assert bot.pinned("vjt_").master == vjt.fingerprint
     chat(net, "bot", "vjt_", "seen you")
     assert texts(net.take("vjt_")) == ["seen you"]
 
@@ -83,7 +102,7 @@ def test_rotation_is_a_re_paste(net, tmp_path):
     chat(net, "vjt", "bot", "new phone")
     assert texts(net.take("bot")) == []
     net.pin("bot", "vjt", key=new.fingerprint)            # the operator re-pastes
-    assert all(p.ed25519 != vjt.fingerprint for p in bot.peers())   # old key gone
+    assert all(p.master != vjt.fingerprint for p in bot.peers())   # old key gone
     net.clock.t += 31
     chat(net, "vjt", "bot", "new phone, again")
     assert "new phone, again" in texts(net.take("bot"))
@@ -110,23 +129,41 @@ def test_a_forged_identity_signature_is_dropped(net):
     net.pair("bot", "eve")
     chat(net, "eve", "bot", "x")
     net.take("bot")
-    out = eve.send("bot", {"t": "text", "body": "i am vjt"}).outbound
-    p = framing.decode_payload("".join(framing.parse(b).chunk for _, b in out))
-    p["id"]["ed25519"] = vjt.fingerprint
-    for body in framing.fragment("PKMSG", framing.encode_payload(p), src=net.did("eve"),
-                                 dst=bot.did, own_mask="eve!e@h", target="bot"):
-        res = bot.receive("eve", body)
+    eve.forget_sessions(bot.fingerprint)
+    net.clock.t += 61
+    net.drop = lambda src, dst, body: framing.parse(body).verb == "PKMSG"
+    chat(net, "eve", "bot", "i am vjt")
+    net.drop = None
+    p = net.captured("PKMSG", "eve")[-1]
+    p["id"]["ed25519"] = vjt.device_key       # eve's signature, vjt's device key
+    res = net.inject("eve", "bot", "PKMSG", p, frm=vjt.did)
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-identity-signature"]
     assert texts(res.events) == []
+
+
+def test_a_pkmsg_whose_from_is_not_its_devices_did_is_dropped(net):
+    bot = net.add("bot")
+    net.add("vjt")
+    net.pair("bot", "vjt")
+    net.drop = lambda src, dst, body: framing.parse(body).verb == "PKMSG"
+    chat(net, "vjt", "bot", "hi")
+    net.drop = None
+    (pk,) = net.captured("PKMSG", "vjt")
+    res = net.inject("vjt", "bot", "PKMSG", pk, frm=bot.did)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["from-mismatch"]
+    assert texts(res.events) == [] and res.outbound == []
 
 
 # --- review of 4a9b057: authentication before any state moves -------------
 
 def _flipped(payload):
     import base64
-    raw = bytearray(base64.b64decode(payload["body"] + "=" * (-len(payload["body"]) % 4)))
-    raw[-1] ^= 1
-    return {**payload, "body": base64.b64encode(bytes(raw)).decode().rstrip("=")}
+
+    def flip(b):
+        raw = bytearray(base64.b64decode(b + "=" * (-len(b) % 4)))
+        raw[-1] ^= 1
+        return base64.b64encode(bytes(raw)).decode().rstrip("=")
+    return {**payload, "bodies": {k: flip(b) for k, b in payload["bodies"].items()}}
 
 
 def test_a_forged_msg_carrying_a_pinned_curve_moves_no_nick_hint(net):
@@ -156,9 +193,10 @@ def test_a_replayed_id_block_moves_no_nick_hint(net):
 
 
 def _claim(signer, curve):
-    from irc_olm.engine import ID_SIG_PREFIX
-    return {"ed25519": signer.fingerprint, "curve25519": curve,
-            "sig": signer._sign(ID_SIG_PREFIX + curve)}
+    """`signer`'s device claiming `curve` under `signer`'s master: a valid
+    signature over a curve it may not hold."""
+    return {"ed25519": signer.device_key, "curve25519": curve,
+            "sig": signer._sign(id_text(curve, signer.fingerprint))}
 
 
 def test_a_curve_bound_to_one_pinned_key_cannot_be_claimed_by_another(net):
@@ -170,10 +208,11 @@ def test_a_curve_bound_to_one_pinned_key_cannot_be_claimed_by_another(net):
     # eve replays vjt's PKMSG under her own key, signing vjt's curve with it:
     # a valid signature over a curve she does not hold (unknown key-share).
     (pk,) = net.captured("PKMSG", "vjt")
-    res = net.inject("eve", "bot", "PKMSG", {**pk, "id": _claim(eve, vjt.identity["curve25519"])})
+    res = net.inject("eve", "bot", "PKMSG", {**pk, "id": _claim(eve, vjt.identity["curve25519"]),
+                                             "master": eve.master_ref})
     assert texts(res.events) == []
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["curve-already-bound"]
-    assert {p.ed25519: p.curve25519 for p in bot.peers()}[eve.fingerprint] is None
+    assert bound(bot, eve) is None
 
 
 def test_a_claimed_curve_is_bound_only_once_a_session_proves_it(net):
@@ -187,25 +226,30 @@ def test_a_claimed_curve_is_bound_only_once_a_session_proves_it(net):
     # eve's own ciphertext, but claiming vjt's curve (vjt never talked yet)
     res = net.inject("eve", "bot", "PKMSG", {**pk, "id": _claim(eve, vjt.identity["curve25519"])})
     assert texts(res.events) == []
-    assert {p.ed25519: p.curve25519 for p in bot.peers()}[eve.fingerprint] is None
+    assert bound(bot, eve) is None
     chat(net, "vjt", "bot", "the real vjt")
     assert texts(net.take("bot")) == ["the real vjt"]
     assert texts(net.inject("eve", "bot", "PKMSG", pk).events) == ["mine"]
 
 
-def test_a_padded_pin_and_a_padded_id_key_are_the_same_key(net):
+def test_a_padded_pin_is_the_key_and_a_padded_key_on_the_wire_is_malformed(net):
+    # The configuration is canonicalised; the wire has one spelling per key
+    # (wire v2, "Encodings"), so two spellings never both pass.
     bot, vjt = net.add("bot"), net.add("vjt")
     net.pin("bot", "vjt", key=vjt.fingerprint + "=")
     net.pin("vjt", "bot")
-    assert [p.ed25519 for p in bot.peers()] == [vjt.fingerprint]
+    assert [p.master for p in bot.peers()] == [vjt.fingerprint]
     net.drop = lambda src, dst, body: framing.parse(body).verb == "PKMSG"
     chat(net, "vjt", "bot", "padded")
     net.drop = None
     (pk,) = net.captured("PKMSG", "vjt")
-    pk["id"]["ed25519"] += "="
-    res = net.inject("vjt", "bot", "PKMSG", pk)
-    assert texts(res.events) == ["padded"]
-    assert not [e for e in res.events if isinstance(e, KeyAlarm)]
+    padded = {**pk, "id": {**pk["id"], "ed25519": pk["id"]["ed25519"] + "="}}
+    res = net.inject("vjt", "bot", "PKMSG", padded)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["malformed-id"]
+    padded = {**pk, "master": {**pk["master"], "ed25519": vjt.fingerprint + "="}}
+    res = net.inject("vjt", "bot", "PKMSG", padded)
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["invalid-master"]
+    assert texts(net.inject("vjt", "bot", "PKMSG", pk).events) == ["padded"]
 
 
 def test_an_id_block_signed_by_the_pinned_key_over_another_curve_is_dropped(net):
@@ -239,8 +283,9 @@ def test_what_was_queued_for_a_replaced_key_never_goes_to_the_new_one(net, tmp_p
 
 def _keys(signer, curve, otk):
     from irc_olm.engine import OTK_SIG_PREFIX
-    return {"v": 1, "id": _claim(signer, curve),
-            "otk": {"key": otk, "fallback": True, "sig": signer._sign(OTK_SIG_PREFIX + otk)}}
+    return {"v": 2, "master": signer.master_block, "devices": [{
+        "id": _claim(signer, curve),
+        "otk": {"key": otk, "fallback": True, "sig": signer._sign(OTK_SIG_PREFIX + otk)}}]}
 
 
 def test_a_pinned_key_claiming_our_own_curve_is_refused(net):
@@ -252,10 +297,10 @@ def test_a_pinned_key_claiming_our_own_curve_is_refused(net):
     res = net.inject("eve", "bot", "KEYS", _keys(eve, bot.identity["curve25519"],
                                                  bot._fallback["key"]))
     assert "own-identity" in [e.reason for e in res.events if isinstance(e, Dropped)]
-    assert [(e.reason, e.lost) for e in res.events if isinstance(e, SendFailed)] == \
-        [("key-mismatch", 1)]
+    # Nothing reachable: the queue waits, to be reported if it expires.
+    assert [e for e in res.events if isinstance(e, SendFailed)] == []
     assert res.outbound == []
-    assert {p.ed25519: p.curve25519 for p in bot.peers()}[eve.fingerprint] is None
+    assert bound(bot, eve) is None
 
 
 def test_our_own_key_in_the_pins_is_never_a_peer(net):
@@ -266,7 +311,8 @@ def test_our_own_key_in_the_pins_is_never_a_peer(net):
     (pk,) = net.captured("PKMSG", "vjt")
     net.pins["bot"]["me"] = bot.fingerprint
     bot.set_pins(net.pins["bot"])
-    res = net.inject("me", "bot", "PKMSG", {**pk, "id": bot.identity})
+    res = net.inject("me", "bot", "PKMSG", {**pk, "id": bot.identity, "master": bot.master_ref},
+                     frm=bot.did)
     assert texts(res.events) == []
     assert "own-identity" in [e.reason for e in res.events if isinstance(e, Dropped)]
 
@@ -282,14 +328,13 @@ def test_a_curve_claimed_through_keys_never_locks_its_owner_out(net):
     net.inject("eve", "bot", "KEYS", _keys(eve, vjt.identity["curve25519"], junk))
     chat(net, "vjt", "bot", "the real vjt")
     (got,) = [e for e in net.take("bot") if isinstance(e, Received)]
-    assert got.peer.ed25519 == vjt.fingerprint
-    bound = {p.ed25519: p.curve25519 for p in bot.peers()}
-    assert bound[vjt.fingerprint] == vjt.identity["curve25519"]
-    assert bound[eve.fingerprint] is None                    # the claim is gone
+    assert got.peer.master == vjt.fingerprint and got.device == vjt.device_key
+    assert bound(bot, vjt) == vjt.identity["curve25519"]
+    assert bound(bot, eve) is None                           # the claim is gone
     bot2 = net.restart("bot")
     chat(net, "bot", "vjt", "after a restart")
     assert texts(net.take("vjt")) == ["after a restart"]
-    assert bot2.pinned("vjt").curve25519 == vjt.identity["curve25519"]
+    assert bound(bot2, vjt) == vjt.identity["curve25519"]
 
 
 def test_keys_cannot_claim_a_curve_another_key_already_claimed(net):
@@ -330,8 +375,8 @@ def test_a_nick_hint_belongs_to_the_key_that_spoke_from_it_last(net):
     chat(net, "c", "bot", "c1")
     _as_nick(net, "a", "x", "bot", a.send("bot", {"t": "text", "body": "a from x"}))
     _as_nick(net, "c", "x", "bot", c.send("bot", {"t": "text", "body": "c from x"}))
-    assert bot.pinned("x").ed25519 == c.fingerprint
-    assert bot.pinned("a").ed25519 == a.fingerprint          # a is back to its own nick
+    assert bot.pinned("x").master == c.fingerprint
+    assert bot.pinned("a").master == a.fingerprint           # a is back to its own nick
 
 
 def test_lines_carrying_a_pinned_key_from_an_unmapped_nick_get_no_nack(net):
@@ -359,9 +404,11 @@ def test_an_ed25519_key_of_33_bytes_is_dropped_not_a_panic(net, verb):
         net.add("vjt")
         net.pin("bot", "vjt")
         bot.send("vjt", {"t": "text", "body": "x"})
-        payload = {"v": 1, "id": ident, "otk": {"key": "A", "fallback": True, "sig": "A"}}
+        payload = {"v": 2, "master": net.engines["vjt"].master_block,
+                   "devices": [{"id": ident, "otk": {"key": "A", "fallback": True, "sig": "A"}}]}
     else:
-        payload = {"v": 1, "id": ident, "body": "A"}
+        payload = {"v": 2, "id": ident, "master": {"ed25519": ed, "cert": "A" * 86},
+                   "bodies": {bot.did: "A"}}
     res = net.inject("vjt" if verb == "KEYS" else "mallory", "bot", verb, payload)
     assert [e for e in res.events if isinstance(e, Dropped)]
 
@@ -396,7 +443,8 @@ def test_only_a_pre_key_message_proves_a_curve_and_the_proof_survives_a_restart(
 
     def proven(engine):
         doc = json.loads(engine.state_path.read_text())
-        return doc["peers"][net.engines["vjt"].fingerprint]["proven"]
+        vjt = net.engines["vjt"]
+        return doc["books"][vjt.fingerprint]["devices"][vjt.device_key]["proven"]
 
     bot, vjt = net.add("bot"), net.add("vjt")
     net.pair("bot", "vjt")
@@ -415,39 +463,51 @@ def test_a_pinned_key_relaying_another_ones_session_never_owns_its_curve(net):
     # mal claims bob's curve and hands us bob's own one-time key; bob's
     # messages then decrypt on "mal's" session. That proves bob holds the
     # curve, not that mal does: bob's first pre-key message takes it back.
-    from irc_olm.engine import ID_SIG_PREFIX, OTK_SIG_PREFIX
+    # Wire v2 closes the relay itself: the pre-key body names the device it
+    # was built for (`fb`), so bob refuses what we built for mal's device.
+    from irc_olm.engine import OTK_SIG_PREFIX
     bot, bob, mal = net.add("bot"), net.add("bob"), net.add("mal")
     for x, y in [("bot", "bob"), ("bot", "mal"), ("bob", "mal")]:
         net.pair(x, y)
     bob_curve = bob.identity["curve25519"]
-    res = net.inject("mal", "bob", "KEYREQ", {"v": 1})
-    otk = framing.decode_payload("".join(framing.parse(b).chunk for _, b in res.outbound))["otk"]["key"]
+    otk = keys_payload(net, "bob", "mal")["devices"][0]["otk"]["key"]
     bot.send("mal", {"t": "text", "body": "for mal"})
     r = net.inject("mal", "bot", "KEYS", {
-        "v": 1, "id": {"ed25519": mal.fingerprint, "curve25519": bob_curve,
-                       "sig": mal._sign(ID_SIG_PREFIX + bob_curve)},
-        "otk": {"key": otk, "fallback": False, "sig": mal._sign(OTK_SIG_PREFIX + otk)}})
-    for _, body in r.outbound:                # mal forwards our PKMSG to bob
-        bob.receive("mal", body)
-    net.pump("bob", bob.send("bot", {"t": "text", "body": "bob on that session"}))
-    net.take("bot")
-    bob.forget_sessions(bot.fingerprint)
-    net.clock.t += 61
+        "v": 2, "master": mal.master_block, "devices": [{
+            "id": _claim(mal, bob_curve),
+            "otk": {"key": otk, "fallback": False, "sig": mal._sign(OTK_SIG_PREFIX + otk)}}]})
+    (pk,) = [p for _, v, p in _messages(r) if v == "PKMSG"]
+    # mal forwards our PKMSG to bob, re-addressed: bob's curve and one-time
+    # key open the session, and the binding refuses it.
+    fwd = net.inject("bot", "bob", "PKMSG", {**pk, "bodies": {bob.did: pk["bodies"][mal.did]}})
+    assert [e.reason for e in fwd.events if isinstance(e, Dropped)] == ["inner-key-mismatch"]
+    assert texts(fwd.events) == [] and bob.devices(bot.fingerprint) == []
     chat(net, "bob", "bot", "bob, a session of his own")
     (got,) = [e for e in net.take("bot") if isinstance(e, Received)]
-    assert got.peer.ed25519 == bob.fingerprint
-    assert bot.pinned("bob").curve25519 == bob_curve
-    assert {p.ed25519: p.curve25519 for p in bot.peers()}[mal.fingerprint] is None
+    assert got.peer.master == bob.fingerprint
+    assert bound(bot, bob) == bob_curve
+    assert bound(bot, mal) is None
 
 
-def test_a_state_file_from_before_proofs_loads_with_nothing_proven(net):
+def _messages(res):
+    """The logical messages in a Result: [(src, verb, payload)]."""
+    out, open_ = [], {}
+    for _, line in res.outbound:
+        f = framing.parse(line)
+        buf = open_.setdefault(f.msgid, [])
+        buf.append(f.chunk)
+        if len(buf) == f.total:
+            out.append((f.src, f.verb, framing.decode_payload("".join(buf))))
+    return out
+
+
+def test_a_wire_v1_state_file_is_refused_not_misread(net):
+    # Wire v2 is a new identity (a master key), and flag-day: the operator
+    # moves the old state away and re-pins.
     import json
-    bot, vjt = net.add("bot"), net.add("vjt")
-    net.pair("bot", "vjt")
-    chat(net, "vjt", "bot", "hi")
+    from irc_olm.engine import StateMismatchError
+    bot = net.add("bot")
     doc = json.loads(bot.state_path.read_text())
-    for p in doc["peers"].values():
-        del p["proven"]
-    bot.state_path.write_text(json.dumps(doc))
-    bot2 = net.restart("bot")
-    assert bot2.pinned("vjt").curve25519 == vjt.identity["curve25519"]
+    bot.state_path.write_text(json.dumps({**doc, "v": 1}))
+    with pytest.raises(StateMismatchError, match="re-pin"):
+        net.restart("bot")

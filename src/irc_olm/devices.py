@@ -227,6 +227,13 @@ class Book:
         keys = frozenset(lst.devices)
         return cls(lst.master, lst.ver, keys, keys, {})
 
+    @classmethod
+    def empty(cls, master: str) -> "Book":
+        """A master whose list we have not seen yet: a pre-key message, which
+        carries a certificate and no list, came first. `ver` 0 is below any
+        list, so the first one replaces it."""
+        return cls(master, 0, frozenset(), frozenset(), {})
+
     def apply(self, lst: DeviceList) -> tuple[Change, set[str]]:
         """Trust rule 3: the change, and the keys it revoked."""
         if lst.master != self.master:
@@ -246,37 +253,66 @@ class Book:
     def revoked(self, ed25519: str) -> bool:
         return ed25519 in self._ever and ed25519 not in self._listed
 
-    def bind(self, ident: dict, *, proven: bool, cert: str | None) -> Device:
-        """Record the curve of a device whose id block verifies under this
-        master and that is trusted: listed (`cert` None, the KEYS path), or
-        certified by `cert` (a pre-key message's), and never revoked here.
-        ValueError otherwise, and for a curve other than the one already
-        bound. A proof, and a certificate, once recorded, stay."""
+    def refusal(self, ident: dict, *, cert: str | None) -> str | None:
+        """Why a device may not be bound under this master, or None: its id
+        block must verify under it, it must never have been revoked here, and
+        it must be listed (`cert` None, the KEYS path) or certified by `cert`
+        (a pre-key message's), with the curve already bound to it if any."""
         if not id_ok(ident, self.master):
-            raise ValueError("the id block does not verify under this master")
+            return "bad-identity-signature"
         ed, curve = ident["ed25519"], ident["curve25519"]
         if self.revoked(ed):
-            raise ValueError("the device is revoked")
+            return "revoked-device"
         if cert is not None and not cert_ok(self.master, ed, cert):
-            raise ValueError("the certificate does not verify under this master")
+            return "bad-certificate"
+        if cert is None and not self.listed(ed):
+            return "unlisted-device"
+        cur = self._devices.get(ed)
+        if cur is not None and cur.curve25519 != curve:
+            return "identity-curve-mismatch"
+        return None
+
+    def bind(self, ident: dict, *, proven: bool, cert: str | None) -> Device:
+        """Record the curve of a device `refusal` lets through, else
+        ValueError with its reason. A proof, and a certificate, once
+        recorded, stay."""
+        reason = self.refusal(ident, cert=cert)
+        if reason is not None:
+            raise ValueError(reason)
+        ed, curve = ident["ed25519"], ident["curve25519"]
         certified = cert is not None
-        if not certified and not self.listed(ed):
-            raise ValueError("the device is not listed")
         cur = self._devices.get(ed)
         if cur is None:
             cur = Device(ed, curve, proven, certified)
-        elif cur.curve25519 != curve:
-            raise ValueError("the device is bound to another curve")
         else:
             cur = replace(cur, proven=cur.proven or proven, certified=cur.certified or certified)
         self._devices[ed] = cur
         return cur
+
+    def unbind(self, ed25519: str) -> None:
+        """Forget a device's curve: another key proved it holds it."""
+        self._devices.pop(ed25519, None)
+
+    def forget_devices(self) -> None:
+        """Forget every curve, keeping the list, its version and what it
+        revoked: the master is no longer pinned, and a re-pin must not roll
+        its list back (trust rule 3)."""
+        self._devices.clear()
 
     def _trusted(self, d: Device) -> bool:
         return not self.revoked(d.ed25519) and (d.certified or self.listed(d.ed25519))
 
     def device(self, ed25519: str) -> Device | None:
         return self._devices.get(ed25519)
+
+    def wanted(self) -> frozenset[str]:
+        """Every device a message to this master is for: the listed ones,
+        with a curve or not yet, and the certified ones not revoked."""
+        return self._listed | {d.ed25519 for d in self._devices.values() if self._trusted(d)}
+
+    def bound(self, curve25519: str) -> Device | None:
+        """The device this curve is bound to, trusted or not."""
+        return next((d for d in self._devices.values() if d.curve25519 == curve25519), None)
 
     def heard(self, ed25519: str, at: float) -> None:
         cur = self._devices.get(ed25519)
@@ -288,14 +324,6 @@ class Book:
         the person typing gets the first copy. Never heard: in key order."""
         live = [d for d in self._devices.values() if self._trusted(d)]
         return sorted(live, key=lambda d: (d.heard_at is None, -(d.heard_at or 0.0), d.ed25519))
-
-    def device_for_curve(self, curve25519: str) -> Device | None:
-        return next((d for d in self._devices.values()
-                     if d.curve25519 == curve25519 and self._trusted(d)), None)
-
-    def revoked_curve(self, curve25519: str) -> bool:
-        return any(d.curve25519 == curve25519 and self.revoked(d.ed25519)
-                   for d in self._devices.values())
 
     def to_doc(self) -> dict:
         return {"master": self.master, "ver": self.ver,

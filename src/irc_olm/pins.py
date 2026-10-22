@@ -1,9 +1,10 @@
 """The operator's pinned keys: the only identities a bot talks E2E with.
 
 One `<nick> <ed25519>` per line, `#` comments and blank lines ignored. The key
-is the peer's Ed25519 identity key as vodozemac prints it (`to_base64()`:
-standard alphabet, unpadded, 43 characters). The nick is where the bot sends
-to; the key is what it trusts. Rotation means re-pasting the key.
+is the peer's master Ed25519 key (wire v2: the one that signs its devices) as
+vodozemac prints it (`to_base64()`: standard alphabet, unpadded, 43
+characters). The nick is where the bot sends to; the key is what it trusts.
+Rotation means re-pasting the key.
 
 The bot only ever READS this file. It must not be writable by the bot's own
 Claude session: the operator makes it root-owned, or denies it to that session

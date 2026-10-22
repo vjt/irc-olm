@@ -215,10 +215,12 @@ def test_a_challenge_a_nack_cannot_resend_is_not_a_lost_message(net, nacker, rea
     elif reason == "unpinned-key":
         del net.pins["bot"]["vjt"]
         bot.set_pins(net.pins["bot"])
-    assert lost(net.inject(nacker, "bot", "NACK", {"v": 1, "ref": ref}).events) == []
+    # From vjt's device (in `from`): only it may NACK what went to it.
+    nack = {"v": 2, "ref": ref}
+    assert lost(net.inject(nacker, "bot", "NACK", nack, frm=vjt.did).events) == []
     # the same NACK for a message a sender wrote is still its loss
-    assert lost(net.inject(nacker, "bot", "NACK", {"v": 1, "ref": text_ref}).events) == \
-        [(reason, 1)]
+    nack = {"v": 2, "ref": text_ref}
+    assert lost(net.inject(nacker, "bot", "NACK", nack, frm=vjt.did).events) == [(reason, 1)]
 
 
 def test_a_challenge_a_nack_cannot_rekey_for_is_not_a_lost_message(net):
@@ -228,19 +230,20 @@ def test_a_challenge_a_nack_cannot_rekey_for_is_not_a_lost_message(net):
                            sender_mask="vjt!vjt@host", line=LINE)
     ref = framing.parse(res.outbound[0][1]).msgid
     text_ref = framing.parse(bot.send("vjt", {"t": "text", "body": "x"}).outbound[0][1]).msgid
-    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref}).events) == []
-    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": text_ref}).events) == \
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref}).events) == []
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 2, "ref": text_ref}).events) == \
         [("rekey-throttled", 1)]
 
 
 def test_a_challenge_nacked_after_its_resend_is_not_a_lost_message(net):
     bot, vjt = establish(net)
+    net.clock.t += 61                      # vjt answers the re-key's KEYREQ
     _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
                            sender_mask="vjt!vjt@host", line=LINE)
     ref = framing.parse(res.outbound[0][1]).msgid
     before = len(net.wire)
-    net.pump("bot", net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref}))   # re-key, re-send
+    net.pump("bot", net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref}))   # re-key, re-send
     (resent,) = {framing.parse(b).msgid for s, _, b in net.wire[before:]
                  if s == "bot" and framing.parse(b).verb in ("PKMSG", "MSG")}
     assert [e.inner["t"] for e in net.take("vjt", Received)] == ["chal"]
-    assert lost(net.inject("vjt", "bot", "NACK", {"v": 1, "ref": resent}).events) == []
+    assert lost(net.inject("vjt", "bot", "NACK", {"v": 2, "ref": resent}).events) == []

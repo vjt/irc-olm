@@ -520,15 +520,50 @@ def test_a_revoked_device_is_no_target_and_its_curve_is_remembered(master):
     book, (a, b) = bound(master, 2)
     book.apply(lst(master, 2, [ed(a)]))
     assert [x.ed25519 for x in book.targets()] == [ed(a)]
-    assert book.revoked_curve(curve(b))
-    assert not book.revoked_curve(curve(a))
-    assert book.device_for_curve(curve(b)) is None
+    assert book.revoked(book.bound(curve(b)).ed25519)
+    assert not book.revoked(book.bound(curve(a)).ed25519)
+    assert book.wanted() == {ed(a)}
 
 
-def test_device_for_curve_finds_only_listed_devices(master):
+def test_bound_finds_the_device_a_curve_is_bound_to(master):
     book, (a,) = bound(master, 1)
-    assert book.device_for_curve(curve(a)).ed25519 == ed(a)
-    assert book.device_for_curve(curve(vz.Account())) is None
+    assert book.bound(curve(a)).ed25519 == ed(a)
+    assert book.bound(curve(vz.Account())) is None
+    book.unbind(ed(a))
+    assert book.bound(curve(a)) is None and book.listed(ed(a))
+
+
+def test_an_empty_book_takes_its_first_list_and_certified_devices(master):
+    a, b = vz.Account(), vz.Account()
+    book = Book.empty(m_key(master))
+    assert book.ver == 0 and book.wanted() == set()
+    assert book.refusal(id_block(a, m_key(master)), cert=None) == "unlisted-device"
+    book.bind(id_block(a, m_key(master)), proven=True, cert=sign_cert(master, ed(a)))
+    assert book.wanted() == {ed(a)}
+    assert book.apply(lst(master, 1, [ed(b)])) == (Change.REPLACED, set())
+    assert book.wanted() == {ed(a), ed(b)}       # certified, and never revoked
+
+
+def test_refusal_names_each_rule(master):
+    book, (a, b) = bound(master, 2)
+    other = vz.Account()
+    assert book.refusal(id_block(a, m_key(other)), cert=None) == "bad-identity-signature"
+    assert book.refusal(id_block(other, m_key(master)), cert=sign_cert(vz.Account(), ed(other))) \
+        == "bad-certificate"
+    assert book.refusal({**id_block(a, m_key(master)), "curve25519": curve(other)}, cert=None) \
+        in ("bad-identity-signature", "identity-curve-mismatch")
+    book.apply(lst(master, 2, [ed(a)]))
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, ed(b))) == \
+        "revoked-device"
+    assert book.refusal(id_block(a, m_key(master)), cert=None) is None
+
+
+def test_forgetting_devices_keeps_the_list_and_its_revocations(master):
+    book, (a, b) = bound(master, 2)
+    book.apply(lst(master, 2, [ed(a)]))
+    book.forget_devices()
+    assert book.targets() == [] and book.ver == 2
+    assert book.revoked(ed(b)) and book.listed(ed(a))
 
 
 def test_bind_takes_an_unlisted_device_its_master_certified(master):
@@ -537,7 +572,7 @@ def test_bind_takes_an_unlisted_device_its_master_certified(master):
     d = book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
     assert d.certified and not book.listed(ed(b))
     assert {x.ed25519 for x in book.targets()} == {ed(a), ed(b)}
-    assert book.device_for_curve(curve(b)).ed25519 == ed(b)
+    assert book.bound(curve(b)).ed25519 == ed(b)
 
 
 def test_bind_refuses_a_cert_that_does_not_verify(master):
@@ -617,7 +652,7 @@ def test_a_book_survives_a_round_trip(master):
     again = Book.from_doc(book.to_doc())
     assert again.master == book.master and again.ver == 2
     assert [d for d in again.targets()] == [d for d in book.targets()]
-    assert again.revoked(ed(c)) and again.revoked_curve(curve(c))
+    assert again.revoked(ed(c)) and again.bound(curve(c)).ed25519 == ed(c)
     assert again.device(ed(a)).proven
     d = vz.Account()
     book.bind(id_block(d, m_key(master)), proven=True, cert=sign_cert(master, ed(d)))

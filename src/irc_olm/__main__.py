@@ -25,8 +25,9 @@ def _identity(args) -> int:
         print(f"{args.state}: no such state file (the bot creates it on first start)",
               file=sys.stderr)
         return 1
-    # The key to paste into the peer's configuration (cicchetto's manual pin).
-    print(doc["identity"]["ed25519"])
+    # The master key to paste into the peer's configuration (cicchetto's
+    # manual pin, a bot's pins file).
+    print(doc["identity"]["master"])
     return 0
 
 
@@ -36,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     k = sub.add_parser("keygen", help="write a new pickle key (mode 600)")
     k.add_argument("path")
     k.set_defaults(func=_keygen)
-    i = sub.add_parser("identity", help="print this identity's Ed25519 key, to paste into peers")
+    i = sub.add_parser("identity", help="print this identity's master key, to paste into peers")
     i.add_argument("--state", required=True)
     i.set_defaults(func=_identity)
     args = p.parse_args(argv)

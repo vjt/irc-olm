@@ -1,5 +1,5 @@
 from irc_olm import framing
-from irc_olm.engine import (Received, Rekeying, SendFailed, Undecryptable)
+from irc_olm.engine import (Dropped, Received, Rekeying, SendFailed, Undecryptable)
 
 
 def texts(events):
@@ -71,17 +71,31 @@ def test_a_late_nack_for_an_older_session_resends_on_the_fresh_one(net):
     assert texts(net.take("bot")) == ["b"]
 
 
-def test_messages_sent_while_a_rekey_is_pending_wait_for_the_new_session(net):
-    from irc_olm.engine import SendQueued
+def both_open_at_once(net):
+    """Both sides ask for keys at once and their PKMSGs cross: each ends up
+    with two sessions (a KEYS opens none to a device that has a working one,
+    so only a crossing makes two)."""
+    from irc_olm.engine import Result
     bot, vjt = net.add("bot"), net.add("vjt")
     net.pair("bot", "vjt")
-    # Both sides open a session at once: each ends up with two.
-    rb = bot.send("vjt", {"t": "text", "body": "x"})
-    rv = vjt.send("bot", {"t": "text", "body": "y"})
-    net.pump("bot", rb)
-    net.pump("vjt", rv)
+    rb, rv = bot.send("vjt", {"t": "text", "body": "x"}), vjt.send("bot", {"t": "text", "body": "y"})
+    kv, kb = vjt.receive("bot", rb.outbound[0][1]), bot.receive("vjt", rv.outbound[0][1])
+    pb, pv = Result(), Result()
+    for _, line in kv.outbound:
+        pb.extend(bot.receive("vjt", line))
+    for _, line in kb.outbound:
+        pv.extend(vjt.receive("bot", line))
+    net.pump("bot", pb)
+    net.pump("vjt", pv)
     assert len(vjt._sessions[bot.identity["curve25519"]]) == 2
+    assert len(bot._sessions[vjt.identity["curve25519"]]) == 2
     net.take("bot"), net.take("vjt")
+    return bot, vjt
+
+
+def test_messages_sent_while_a_rekey_is_pending_wait_for_the_new_session(net):
+    from irc_olm.engine import SendQueued
+    bot, vjt = both_open_at_once(net)
     net.clock.t += 61
     bot.forget_sessions(vjt.fingerprint)                 # every session, not just one
     net.drop = lambda src, dst, body: framing.parse(body).verb == "KEYS"
@@ -100,7 +114,7 @@ def test_a_nack_older_than_the_resend_memory_is_ignored(net):
     out = bot.send("vjt", {"t": "text", "body": "old news"}).outbound
     ref = framing.parse(out[0][1]).msgid
     net.clock.t += SENT_MEMORY + 1
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref})
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
     assert res.outbound == []
 
@@ -140,7 +154,7 @@ def test_a_nack_burst_rekeys_once(net):
     sent = [vjt.send("bot", {"t": "text", "body": f"m{i}"}) for i in range(5)]
     events, keyreqs = [], 0
     for r in sent:
-        res = net.inject("bot", "vjt", "NACK", {"v": 1, "ref": msgid_of(r)})
+        res = net.inject("bot", "vjt", "NACK", {"v": 2, "ref": msgid_of(r)})
         events += res.events
         keyreqs += sum(framing.parse(b).verb == "KEYREQ" for _, b in res.outbound)
     assert sum(isinstance(e, Rekeying) for e in events) == 1
@@ -156,7 +170,7 @@ def test_a_message_is_resent_once_then_reported_lost(net):
     for _ in range(3):
         net.clock.t += 61
         before = len(net.wire)
-        net.pump("vjt", net.inject("bot", "vjt", "NACK", {"v": 1, "ref": ref}))
+        net.pump("vjt", net.inject("bot", "vjt", "NACK", {"v": 2, "ref": ref}))
         resent = [b for s, _, b in net.wire[before:]
                   if s == "vjt" and framing.parse(b).verb in ("PKMSG", "MSG")]
         if resent:
@@ -171,7 +185,11 @@ def test_a_nack_from_another_nick_reports_the_loss_and_resends_nothing(net):
     net.pair("bot", "eve")
     out = bot.send("vjt", {"t": "text", "body": "x"}).outbound
     ref = framing.parse(out[0][1]).msgid
-    res = net.inject("eve", "bot", "NACK", {"v": 1, "ref": ref})
+    # Only the device the message went to may NACK it...
+    res = net.inject("eve", "bot", "NACK", {"v": 2, "ref": ref})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
+    # ...and its did in `from`, from another nick, still re-sends nothing.
+    res = net.inject("eve", "bot", "NACK", {"v": 2, "ref": ref}, frm=vjt.did)
     assert [(e.nick, e.reason, e.lost) for e in res.events if isinstance(e, SendFailed)] == \
         [("vjt", "nack-from-another-nick", 1)]
     assert res.outbound == []
@@ -186,7 +204,7 @@ def test_a_nack_for_a_nick_pinned_to_another_key_since_resends_nothing(net):
     net.pins["bot"]["vjt"] = net.engines["vjt2"].fingerprint
     net.pins["bot"]["vjtold"] = vjt.fingerprint
     bot.set_pins(net.pins["bot"])
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref})
     assert [e.reason for e in res.events if isinstance(e, SendFailed)] == ["repinned"]
     assert res.outbound == []
 
@@ -224,7 +242,7 @@ def test_a_nack_after_unpin_and_repin_stores_no_session_under_no_curve(net):
     ref = framing.parse(out[0][1]).msgid
     bot.set_pins({})
     net.pin("bot", "vjt")
-    net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
+    net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref})
     assert None not in bot._sessions
     state = json.loads(bot.state_path.read_text())
     assert "null" not in state["sessions"]
@@ -241,19 +259,13 @@ def test_keys_after_the_queue_expired_report_no_empty_loss(net):
     eve = net.add("eve")                    # not pinned: an impostor's KEYS
     otk = eve._fallback["key"]
     res = net.inject("vjt", "bot", "KEYS", {
-        "v": 1, "id": eve.identity,
-        "otk": {"key": otk, "fallback": True, "sig": eve._sign(OTK_SIG_PREFIX + otk)}})
+        "v": 2, "master": eve.master_block, "devices": [{"id": eve.identity, "otk": {
+            "key": otk, "fallback": True, "sig": eve._sign(OTK_SIG_PREFIX + otk)}}]})
     assert [e for e in res.events if isinstance(e, SendFailed)] == []
 
 
 def test_a_nack_for_an_older_session_while_a_rekey_is_pending_waits_for_it(net):
-    bot, vjt = net.add("bot"), net.add("vjt")
-    net.pair("bot", "vjt")
-    # Both sides open a session at once: each ends up with two.
-    rb, rv = bot.send("vjt", {"t": "text", "body": "x"}), vjt.send("bot", {"t": "text", "body": "y"})
-    net.pump("bot", rb)
-    net.pump("vjt", rv)
-    net.take("bot"), net.take("vjt")
+    bot, vjt = both_open_at_once(net)
     curve = bot.identity["curve25519"]
     ra = vjt.send("bot", {"t": "text", "body": "a"})
     first = vjt._sessions[curve][0].session_id
@@ -278,7 +290,7 @@ def test_a_nack_for_a_long_message_still_finds_it_minutes_later(net):
     out = bot.send("vjt", {"t": "text", "body": "long"}).outbound
     ref = framing.parse(out[0][1]).msgid
     net.clock.t += 64 * 5 + 30
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": ref})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": ref})
     assert not [e for e in res.events if isinstance(e, Dropped)]
     assert res.outbound                               # re-keying to re-send it
 
@@ -287,7 +299,7 @@ def test_the_resend_memory_is_bounded_in_messages_too(net):
     from irc_olm.engine import SENT_MAX, Dropped
     bot, vjt = establish(net)
     refs = [msgid_of(bot.send("vjt", {"t": "text", "body": f"m{i}"})) for i in range(SENT_MAX + 1)]
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": refs[0]})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": refs[0]})
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["unknown-nack-ref"]
-    res = net.inject("vjt", "bot", "NACK", {"v": 1, "ref": refs[-1]})
+    res = net.inject("vjt", "bot", "NACK", {"v": 2, "ref": refs[-1]})
     assert not [e for e in res.events if isinstance(e, Dropped)]
