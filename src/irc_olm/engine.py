@@ -31,6 +31,7 @@ from typing import Callable
 import vodozemac as vz
 
 from . import framing
+from .devices import did
 from .challenge import Challenge, ChallengeBook, new_challenge
 from .framing import PayloadError, fold
 from .keys import b64, ed25519_key, sig_ok, unb64
@@ -275,6 +276,13 @@ class Engine:
                     "sig": self._sign(ID_SIG_PREFIX + curve)}
 
     @property
+    def did(self) -> str:
+        """This device's address on the wire (wire v2): who its lines are
+        from, and the only `to` it takes besides `*`."""
+        with self._lock:
+            return did(self._account.ed25519_key.to_base64())
+
+    @property
     def fingerprint(self) -> str:
         with self._lock:
             return self._account.ed25519_key.to_base64()
@@ -397,7 +405,7 @@ class Engine:
         if last is not None and self._now() - last < KEYREQ_RETRY:
             return
         self._keyreq_at[key] = self._now()
-        self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res, urgent=True)
+        self._emit(nick, "KEYREQ", {"v": WIRE_VERSION}, res, to=framing.ANY, urgent=True)
 
     def _encrypt(self, nick: str, peer: Peer, msg: _Outgoing, res: Result) -> None:
         ttl = None if msg.expires is None else msg.expires - self._now()
@@ -412,7 +420,8 @@ class Engine:
             verb, payload = "MSG", {"v": WIRE_VERSION, "ck": self.identity["curve25519"],
                                     "body": b64(ct)}
         try:
-            msgid = self._emit(nick, verb, payload, res, urgent=msg.urgent, ttl=ttl)
+            msgid = self._emit(nick, verb, payload, res, to=did(peer.ed25519),
+                               urgent=msg.urgent, ttl=ttl)
         except PayloadError:
             # More than 64 fragments: the session goes back to where it was,
             # leaving the peer no message key to skip (past 40 skipped, Olm
@@ -425,12 +434,14 @@ class Engine:
         self._sent[msgid] = _Sent(nick, peer.ed25519, sessions[0].session_id, msg, self._now())
         self._trim_sent()
 
-    def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, urgent: bool,
+    def _emit(self, nick: str, verb: str, payload: dict, res: Result, *, to: str, urgent: bool,
               ttl: float | None = None) -> str:
         mask = self.own_mask or framing.conservative_mask(self.nick, self.ident)
         msgid = framing.new_msgid()
-        for body in framing.fragment(verb, framing.encode_payload(payload), own_mask=mask,
-                                     target=nick, linelen=self.linelen, msgid=msgid):
+        src = framing.ANY if verb == "KEYS" else self.did   # a KEYS describes the user
+        for body in framing.fragment(verb, framing.encode_payload(payload), src=src, dst=to,
+                                     own_mask=mask, target=nick, linelen=self.linelen,
+                                     msgid=msgid):
             res.outbound.append((nick, body))
         if urgent:
             res.urgent[msgid] = ttl
@@ -460,6 +471,11 @@ class Engine:
                 return res
             if isinstance(done, Rejected):
                 res.events.append(Dropped(nick, f"reassembly:{done.reason}", done.verb))
+                return res
+            if done.dst not in (self.did, framing.ANY):
+                # Another device's line (grappa routes by `to`; a bot sees
+                # whatever IRC brings it).
+                res.events.append(Dropped(nick, "not-for-this-device", done.verb))
                 return res
             try:
                 payload = framing.decode_payload(done.payload)
@@ -510,7 +526,7 @@ class Engine:
         else:
             entry = {"key": self._fallback["key"], "fallback": True, "sig": self._fallback["sig"]}
         self._emit(nick, "KEYS", {"v": WIRE_VERSION, "id": self.identity, "otk": entry}, res,
-                   urgent=True)
+                   to=msg.src, urgent=True)
 
     def _on_keys(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         key = fold(nick)
@@ -562,12 +578,12 @@ class Engine:
             # second case recovers. A replayer only gets a NACK back for a
             # msgid that is not its own.
             res.events.append(Replayed(nick, sid))
-            return self._undecryptable(nick, msg.msgid, "replayed-session", peer, res)
+            return self._undecryptable(nick, msg, "replayed-session", peer, res)
         try:
             session, plaintext = self._account.create_inbound_session(
                 vz.Curve25519PublicKey.from_base64(peer.curve25519), pre)
         except vz.SessionCreationException as e:
-            return self._undecryptable(nick, msg.msgid, f"session-creation:{e}", peer, res)
+            return self._undecryptable(nick, msg, f"session-creation:{e}", peer, res)
         self._seen[sid] = None
         while len(self._seen) > SEEN_SESSIONS_MAX:
             self._seen.popitem(last=False)
@@ -586,10 +602,10 @@ class Engine:
                 return
             # A pinned nick whose key we never saw a session for (our state
             # was lost?): a NACK makes it open a fresh one, with its id block.
-            return self._undecryptable(nick, msg.msgid, "no-session", mapped, res)
+            return self._undecryptable(nick, msg, "no-session", mapped, res)
         peer = self._peers[owner]
         if not self._sessions.get(peer.curve25519):
-            return self._undecryptable(nick, msg.msgid, "no-session", peer, res)
+            return self._undecryptable(nick, msg, "no-session", peer, res)
         # Nothing about the peer moves before a decrypt succeeds: `ck` is
         # public, and anyone can put it on a line.
         any_msg = vz.AnyOlmMessage.from_parts(1, unb64(payload["body"]))
@@ -598,14 +614,14 @@ class Engine:
                 return self._decrypted(nick, peer, msg, s, any_msg, res)
             except vz.OlmDecryptionException:
                 continue
-        self._undecryptable(nick, msg.msgid, "decryption-failed", peer, res)
+        self._undecryptable(nick, msg, "decryption-failed", peer, res)
 
     def _decrypted(self, nick, peer, msg, session, any_msg, res) -> None:
         try:
             plaintext = session.decrypt(any_msg)
         except vz.OlmDecryptionException:
             if msg.verb == "PKMSG":
-                return self._undecryptable(nick, msg.msgid, "decryption-failed", peer, res)
+                return self._undecryptable(nick, msg, "decryption-failed", peer, res)
             raise
         # The session the peer just used is the one to answer on.
         lst = self._sessions[peer.curve25519]
@@ -670,16 +686,17 @@ class Engine:
         self._keyreq_at.pop(fold(nick), None)
         self._enqueue(nick, peer, replace(sent.msg, sends=sent.msg.sends + 1), res)
 
-    def _undecryptable(self, nick: str, msgid: str, reason: str, peer: Peer,
+    def _undecryptable(self, nick: str, msg: Assembled, reason: str, peer: Peer,
                        res: Result) -> None:
         """Report it, and NACK when `nick` is where `peer`, the key the line
         claims, is reached: a pinned key's curve and id block are public, and
         anyone can put them on a line. Every such message gets its own NACK,
         one line out per message in: the sender re-sends what is NACKed, and
         a message without a NACK is lost without a word."""
-        res.events.append(Undecryptable(nick, msgid, reason))
+        res.events.append(Undecryptable(nick, msg.msgid, reason))
         if self._reached_at(nick, peer):
-            self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msgid}, res, urgent=True)
+            self._emit(nick, "NACK", {"v": WIRE_VERSION, "ref": msg.msgid}, res, to=msg.src,
+                       urgent=True)
 
     def _reached_at(self, nick: str, peer: Peer) -> bool:
         """Whether sending to `nick` reaches `peer`'s key."""

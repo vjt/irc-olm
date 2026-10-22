@@ -4,6 +4,7 @@ import random
 import pytest
 
 from flud_model import FludModel
+from wire_addr import addr
 from irc_olm.pacing import Lane, Pacer
 
 
@@ -255,9 +256,9 @@ def test_lines_the_application_writes_count_in_the_same_bank():
 
 
 def _message(n_lines_wanted, target="vjt"):
-    size = 300 * n_lines_wanted
+    size = 420 * n_lines_wanted       # a chunk carries about 438 characters
     payload = framing.encode_payload({"v": 1, "body": "z" * size})
-    bodies = framing.fragment("MSG", payload, own_mask="bot!b@h", target=target)
+    bodies = framing.fragment("MSG", payload, **addr("MSG"), own_mask="bot!b@h", target=target)
     assert (len(bodies) > 1) == (n_lines_wanted > 1)
     return bodies
 
@@ -308,7 +309,7 @@ def test_the_per_target_window_still_holds_for_single_lines():
     # Small lines (KEYREQs, 2 s each): the bank would let five through at
     # once, the receiver's CTCP flood limit only three.
     keyreq = lambda: framing.fragment("KEYREQ", framing.encode_payload({"v": 1}),  # noqa: E731
-                                      own_mask="bot!b@h", target="vjt")[0]
+                                      **addr("KEYREQ"), own_mask="bot!b@h", target="vjt")[0]
     p = Pacer(fakelag=FakeLag())
     p.submit("vjt", [keyreq() for _ in range(6)], lane=Lane.URGENT)
     _, out = run_against_server(p)
@@ -409,7 +410,8 @@ def msg(target, *costs, verb="MSG"):
     msgid = framing.new_msgid()
     out = []
     for i, c in enumerate(costs, 1):
-        head = f"\x01E2E {verb} {msgid} {i}/{len(costs)} "
+        a = addr(verb)
+        head = f"\x01E2E {verb} {msgid} {i}/{len(costs)} {a['src']} {a['dst']} "
         frame = len(f"PRIVMSG {target} :".encode()) + len(head) + 1 + 2   # \x01, CRLF
         out.append(head + "A" * ((120 * (c - 2) + 10 if c > 2 else 100) - frame) + "\x01")
         assert FakeLag.cost(f"PRIVMSG {target} :{out[-1]}") == c
@@ -750,7 +752,7 @@ def test_reactive_and_text_lines_leave_the_reserve_to_urgent_ones():
 def test_lanes_follow_the_verb_and_the_engines_urgent_set():
     def body(verb, payload=None):
         return framing.fragment(verb, framing.encode_payload(payload or {"v": 1}),
-                                own_mask="bot!b@h", target="vjt")[0]
+                                **addr(verb), own_mask="bot!b@h", target="vjt")[0]
     chal, text, keyreq = body("MSG"), body("MSG"), body("KEYREQ")
     urgent = {framing.parse(chal).msgid: 15.0, framing.parse(keyreq).msgid: None}
     assert lane_of(keyreq, urgent) is Lane.URGENT

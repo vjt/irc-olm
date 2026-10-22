@@ -18,6 +18,8 @@ from .framing import MAX_FRAGMENTS, Fragment
 class Assembled:
     verb: str
     msgid: str
+    src: str
+    dst: str
     payload: str
 
 
@@ -31,6 +33,8 @@ class Rejected:
 @dataclass
 class _Pending:
     verb: str
+    src: str
+    dst: str
     total: int
     started: float
     last: float          # the latest fragment: paced, a long message takes minutes
@@ -71,7 +75,7 @@ class Reassembler:
         if frag.total > self.max_fragments:
             return Rejected(frag.msgid, "too-many-fragments", frag.verb)
         if frag.total == 1:
-            return Assembled(frag.verb, frag.msgid, frag.chunk)
+            return Assembled(frag.verb, frag.msgid, frag.src, frag.dst, frag.chunk)
 
         mine = self._pending.setdefault(sender, {})
         p = mine.get(frag.msgid)
@@ -79,8 +83,9 @@ class Reassembler:
             if len(mine) >= self.max_pending:
                 return self._reject(sender, frag, "too-many-pending")
             now = self.clock()
-            p = mine[frag.msgid] = _Pending(frag.verb, frag.total, now, now)
-        elif p.verb != frag.verb or p.total != frag.total:
+            p = mine[frag.msgid] = _Pending(frag.verb, frag.src, frag.dst, frag.total, now, now)
+        elif (p.verb, p.src, p.dst, p.total) != (frag.verb, frag.src, frag.dst, frag.total):
+            # Every fragment repeats the first one's header (wire v2).
             return self._reject(sender, frag, "inconsistent-fragment")
         if frag.index in p.chunks:
             return self._reject(sender, frag, "duplicate-fragment")
@@ -94,7 +99,8 @@ class Reassembler:
                 return Rejected(frag.msgid, "global-byte-cap", frag.verb)
             return None
         self._drop(sender, frag.msgid)
-        return Assembled(p.verb, frag.msgid, "".join(p.chunks[i] for i in range(1, p.total + 1)))
+        return Assembled(p.verb, frag.msgid, p.src, p.dst,
+                         "".join(p.chunks[i] for i in range(1, p.total + 1)))
 
     def _reject(self, sender: str, frag: Fragment, reason: str) -> Rejected:
         self._drop(sender, frag.msgid)

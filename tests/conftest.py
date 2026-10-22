@@ -80,12 +80,21 @@ class Net:
                     out.append((src, f.verb, framing.decode_payload("".join(buf))))
         return out
 
-    def inject(self, src, dst, verb, payload):
+    def did(self, nick):
+        """`nick`'s device address, or a stranger's for a nick with no engine."""
+        return self.engines[nick].did if nick in self.engines else "Str4nger-___"[:11]
+
+    def inject(self, src, dst, verb, payload, *, frm=None, to=None):
         """Hand-built traffic: `payload` framed as `verb` from `src`, fed to
-        `dst` only (nothing is pumped back). Returns the merged Result."""
+        `dst` only (nothing is pumped back). Returns the merged Result. The
+        line's `from` and `to` follow the table unless given."""
         from irc_olm.engine import Result
+        if frm is None:
+            frm = framing.ANY if verb == "KEYS" else self.did(src)
+        if to is None:
+            to = framing.ANY if verb == "KEYREQ" else self.did(dst)
         res = Result()
-        for body in framing.fragment(verb, framing.encode_payload(payload),
+        for body in framing.fragment(verb, framing.encode_payload(payload), src=frm, dst=to,
                                      own_mask=f"{src}!x@h", target=dst):
             res.extend(self.engines[dst].receive(src, body))
         return res

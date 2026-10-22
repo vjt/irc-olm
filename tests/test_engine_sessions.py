@@ -158,7 +158,8 @@ def test_undecryptable_message_triggers_a_nack(net):
     raw = bytearray(base64.b64decode(p["body"] + "=" * (-len(p["body"]) % 4)))
     raw[-1] ^= 1
     p["body"] = base64.b64encode(bytes(raw)).decode().rstrip("=")
-    for body in framing.fragment(frags[0].verb, framing.encode_payload(p), own_mask="vjt!x@y", target="bot"):
+    for body in framing.fragment(frags[0].verb, framing.encode_payload(p), src=frags[0].src,
+                                 dst=frags[0].dst, own_mask="vjt!x@y", target="bot"):
         res = bot.receive("vjt", body)
     assert any(isinstance(e, Undecryptable) for e in res.events)
     assert [framing.parse(b).verb for _, b in res.outbound] == ["NACK"]
@@ -169,8 +170,8 @@ def test_unsolicited_keys_are_dropped(net):
     eve = net.add("eve")
     net.pin("eve", "bot")
     keys_from_bot = bot.receive("vjt", vjt.send("bot", {"t": "text", "body": "x"}).outbound[0][1])
-    for _, body in keys_from_bot.outbound:
-        res = eve.receive("bot", body)
+    keys = framing.decode_payload("".join(framing.parse(b).chunk for _, b in keys_from_bot.outbound))
+    res = net.inject("bot", "eve", "KEYS", keys)        # addressed to eve, who asked for none
     assert any(isinstance(e, Dropped) and e.reason == "unsolicited-keys" for e in res.events)
 
 
@@ -183,14 +184,16 @@ def test_received_event_repr_never_shows_plaintext(net):
 
 @pytest.mark.parametrize("payload", [
     {"v": 1},                                         # KEYS without id/otk
-    {"v": 1, "id": "not a dict", "otk": {}},
+    {"v": 1, "id": "not-a-dict", "otk": {}},
     {"v": 1, "id": {"ed25519": "x", "curve25519": "y", "sig": "z"}, "otk": {"key": 1}},
 ])
 def test_malformed_payloads_are_dropped_not_raised(net, payload):
     bot, vjt = paired(net)
     vjt.send("bot", {"t": "text", "body": "x"})   # so KEYS would be solicited
     for verb in ("KEYS", "PKMSG", "MSG", "NACK"):
-        body = framing.fragment(verb, framing.encode_payload(payload), own_mask="bot!b@h", target="vjt")[0]
+        body = framing.fragment(verb, framing.encode_payload(payload),
+                                src=framing.ANY if verb == "KEYS" else bot.did, dst=vjt.did,
+                                own_mask="bot!b@h", target="vjt")[0]
         res = vjt.receive("bot", body)
         assert all(isinstance(e, Dropped) or e.__class__.__name__ in ("SendFailed", "Undecryptable")
                    for e in res.events), (verb, res.events)
@@ -203,8 +206,9 @@ def test_a_deeply_nested_payload_is_dropped_not_raised(net):
     bot, vjt = paired(net)
     # A NACK whose ref is the nesting: undecodable where the scanner
     # recurses (< 3.12), an unhashable ref where it does not. Dropped both ways.
-    body = base64.b64encode(('{"v":1,"ref":' + DEEP + "}").encode()).decode()
-    for frag in framing.fragment("NACK", body, own_mask="vjt!x@h", target="bot"):
+    body = '{"v":1,"ref":' + DEEP + "}"
+    for frag in framing.fragment("NACK", body, src=vjt.did, dst=bot.did, own_mask="vjt!x@h",
+                                 target="bot"):
         res = bot.receive("vjt", frag)
     assert all(isinstance(e, Dropped) for e in res.events)
     assert res.outbound == []
@@ -541,7 +545,7 @@ def test_a_message_evicted_by_the_global_reassembly_cap_is_reported(net):
 
     def frags(size):
         return framing.fragment("MSG", framing.encode_payload({"v": 1, "body": "x" * size}),
-                                own_mask="x!x@h", target="bot")
+                                src="Str4nger-__", dst=bot.did, own_mask="x!x@h", target="bot")
     big = frags(900)
     assert len(big) == 3
     for f in big[:2]:

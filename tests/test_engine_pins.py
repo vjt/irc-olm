@@ -113,7 +113,8 @@ def test_a_forged_identity_signature_is_dropped(net):
     out = eve.send("bot", {"t": "text", "body": "i am vjt"}).outbound
     p = framing.decode_payload("".join(framing.parse(b).chunk for _, b in out))
     p["id"]["ed25519"] = vjt.fingerprint
-    for body in framing.fragment("PKMSG", framing.encode_payload(p), own_mask="eve!e@h", target="bot"):
+    for body in framing.fragment("PKMSG", framing.encode_payload(p), src=net.did("eve"),
+                                 dst=bot.did, own_mask="eve!e@h", target="bot"):
         res = bot.receive("eve", body)
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-identity-signature"]
     assert texts(res.events) == []
