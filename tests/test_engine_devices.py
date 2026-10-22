@@ -334,6 +334,8 @@ def test_a_due_rekey_asks_nothing_of_a_nick_unpinned_since(net):
     bot.set_pins({})
     net.clock.t += KEYREQ_RETRY
     assert bot.tick().outbound == []
+    bot.set_pins({"alice": a0.fingerprint})       # and forgotten, not just skipped
+    assert bot.tick().outbound == []
 
 
 def test_a_rekey_whose_keys_open_nothing_still_counts_for_the_minute(net):
