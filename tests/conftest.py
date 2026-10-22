@@ -1,6 +1,7 @@
 import pytest
 
 from irc_olm import framing, store
+from irc_olm.devices import MAX_DEVICES
 from irc_olm.engine import Engine
 
 
@@ -53,7 +54,8 @@ class Net:
 
     def add_user(self, nick, n, ver=1):
         """`nick` as a cicchetto user with `n` devices under one master, all
-        listed, labelled "nick.0" .. "nick.<n-1>". The Net plays the user's
+        listed (the first four when `n` is more: a list holds four),
+        labelled "nick.0" .. "nick.<n-1>". The Net plays the user's
         grappa: it answers a KEYREQ to the nick with every listed device, and
         hands each line to every device (each keeps its own `to` and body)."""
         devs = [self.add(f"{nick}.{i}") for i in range(n)]
@@ -64,7 +66,7 @@ class Net:
         self.devices[nick], self.engines[nick] = devs, devs[0]
         self.pins[nick] = {}
         self.events.setdefault(nick, [])
-        self.relist(nick, devs, ver)
+        self.relist(nick, devs[:MAX_DEVICES], ver)
         return devs
 
     def relist(self, nick, keep, ver):

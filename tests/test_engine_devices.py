@@ -257,3 +257,22 @@ def test_one_time_keys_are_signed_by_their_own_device(net):
     bot.send("alice", text("x"))
     res = net.inject("alice", "bot", "KEYS", keys)
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["bad-otk-signature"]
+
+
+def test_more_trusted_devices_than_a_message_holds_go_in_two_messages(net):
+    from irc_olm.devices import MAX_DEVICES
+    bot, devs = setup(net, 5)                     # a0..a3 listed
+    net.pump("bot", bot.send("alice", text("hi")))
+    net.relist("alice", devs[:3] + devs[4:], 2)   # a4 replaces a3
+    # a4 writes first; the list that drops a3 has not reached the bot yet.
+    net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
+    net.pump("alice.4", devs[4].send("bot", text("new laptop")))
+    net.drop = None
+    assert texts(net.take("bot")) == ["new laptop"]
+    n = len(sent(net, "bot"))
+    net.pump("bot", bot.send("alice", text("welcome")))
+    assert [texts(net.take(f"alice.{i}"))[-1:] for i in range(5)] == [["welcome"]] * 5
+    groups = [set(p["bodies"]) for v, _, p in sent(net, "bot")[n:] if v in ("MSG", "PKMSG")]
+    assert sorted(map(len, groups[:2])) == [1, MAX_DEVICES]
+    assert set().union(*groups[:2]) == {d.did for d in devs}
+    assert net.take("bot", SendFailed) == []

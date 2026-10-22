@@ -512,9 +512,10 @@ class Engine:
 
     def _encrypt(self, nick: str, peer: Peer, msg: _Outgoing, ready: list[Device],
                  res: Result) -> frozenset[str]:
-        """One body per device in `ready`: one MSG for the devices whose
-        session has heard from them, one PKMSG for the rest (never both kinds
-        in one message). Returns the device keys it went to, or tried to."""
+        """One body per device in `ready`: MSG bodies for the devices whose
+        session has heard from them, PKMSG bodies for the rest, never both
+        kinds in one message. Returns the device keys it went to, or tried
+        to."""
         tried = frozenset(d.ed25519 for d in ready)
         ttl = None if msg.expires is None else msg.expires - self._now()
         if ttl is not None and ttl <= 0:
@@ -542,19 +543,12 @@ class Engine:
             kinds.setdefault(mtype, {})[did(d.ed25519)] = (d, before, b64(ct))
         failed: list[tuple[Device, str, str]] = []
         for mtype, bodies in kinds.items():
-            try:
-                self._emit_bodies(nick, peer, mtype, bodies, msg, ttl, res)
-            except PayloadError:
-                # More than 64 fragments together: one message per device,
-                # each with its own body, is what still fits, if anything.
-                if len(bodies) == 1:
-                    failed.extend(bodies.values())
-                    continue
-                for addr, body in bodies.items():
-                    try:
-                        self._emit_bodies(nick, peer, mtype, {addr: body}, msg, ttl, res)
-                    except PayloadError:
-                        failed.append(body)
+            # A message holds MAX_DEVICES bodies at most, and a full list
+            # plus a device trusted on its certificate alone is one more.
+            group = list(bodies.items())
+            for i in range(0, len(group), MAX_DEVICES):
+                failed += self._emit_group(nick, peer, mtype, dict(group[i:i + MAX_DEVICES]),
+                                           msg, ttl, res)
         for d, before, _ in failed:
             # The session goes back to where it was, leaving the peer no
             # message key to skip (past 40 skipped, Olm forgets the oldest,
@@ -564,6 +558,27 @@ class Engine:
             self._lost(nick, "too-long", [msg], res)
         self._save()        # before any of it leaves: the caller sends it
         return tried
+
+    def _emit_group(self, nick: str, peer: Peer, mtype: int,
+                    bodies: dict[str, tuple[Device, str, str]], msg: _Outgoing,
+                    ttl: float | None, res: Result) -> list[tuple[Device, str, str]]:
+        """`bodies` in one message, else one message each; the bodies that
+        did not fit even alone."""
+        try:
+            self._emit_bodies(nick, peer, mtype, bodies, msg, ttl, res)
+            return []
+        except PayloadError:
+            # More than 64 fragments together: one message per device,
+            # each with its own body, is what still fits, if anything.
+            if len(bodies) == 1:
+                return list(bodies.values())
+        failed = []
+        for addr, body in bodies.items():
+            try:
+                self._emit_bodies(nick, peer, mtype, {addr: body}, msg, ttl, res)
+            except PayloadError:
+                failed.append(body)
+        return failed
 
     def _emit_bodies(self, nick: str, peer: Peer, mtype: int,
                      bodies: dict[str, tuple[Device, str, str]], msg: _Outgoing,
