@@ -456,3 +456,44 @@ def test_the_engines_inner_fields_are_its_own_both_ways(net, monkeypatch):
     net.pump("bot", bot.send("alice", {"t": "text", "body": "x", "lv": 99, "fb": "forged"}))
     (got,) = net.take("alice.0", Received)
     assert got.inner == {"t": "text", "body": "x"}
+
+
+def test_a_first_session_the_device_cannot_open_is_rekeyed_at_once(net):
+    # The minute counts re-keys after NACKs: the KEYS that opened the first
+    # session is no re-key.
+    from irc_olm.engine import KEYREQ_RETRY
+    bot, (a0,) = setup(net, 1)
+    before = a0._account.pickle(a0._key)
+    serve = net._grappa_keys
+
+    def stale(nick, asker, keyreq):               # grappa serves a one-time key
+        res = serve(nick, asker, keyreq)          # the device no longer holds
+        a0._account = vz.Account.from_pickle(before, a0._key)
+        return res
+    net._grappa_keys = stale
+    net.pump("bot", bot.send("alice", text("hello")))
+    net._grappa_keys = serve
+    assert texts(net.take("alice.0")) == []
+    assert [e.device for e in net.take("bot", Rekeying)] == [a0.device_key]
+    net.clock.t += KEYREQ_RETRY
+    net.pump("bot", bot.tick())
+    assert texts(net.take("alice.0")) == ["hello"]
+    assert net.take("bot", SendFailed) == []
+
+
+def test_the_rekey_minute_runs_from_the_rekey_not_from_its_keys(net):
+    from irc_olm.engine import KEYREQ_RETRY, REKEY_INTERVAL
+    bot, (a0, a1, a2), nacks = nacked_inside_the_budget(net)
+    net.no_keys = set()
+    net.clock.t += 1
+    start = net.clock.t
+    assert [e for e in bot.receive("alice", nacks[0]).events if isinstance(e, Rekeying)]
+    bot.receive("alice", nacks[1])                # a2 joins it
+    net.clock.t += KEYREQ_RETRY - 1
+    net.pump("bot", bot.tick())                   # its KEYREQ and KEYS, half a minute on
+    assert [texts(net.take(f"alice.{i}"))[-1:] for i in (0, 2)] == [["two"], ["two"]]
+    net.clock.t = start + REKEY_INTERVAL
+    a0.forget_sessions(bot.fingerprint)           # lost again, a minute after the re-key
+    net.pump("bot", bot.send("alice", text("three")))
+    assert [e.device for e in net.take("bot", Rekeying)] == [a0.device_key]
+    assert net.take("bot", SendFailed) == []

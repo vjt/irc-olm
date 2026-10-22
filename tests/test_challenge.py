@@ -227,7 +227,11 @@ def test_a_challenge_a_nack_cannot_resend_is_not_a_lost_message(net, nacker, rea
 
 def test_a_challenge_a_nack_cannot_rekey_for_is_not_a_lost_message(net):
     bot, vjt = paired(net)
-    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))   # the bot opened it
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))
+    net.clock.t += 61
+    vjt.forget_sessions(bot.fingerprint)          # a re-key, done: its minute runs
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "again"}))
+    net.pump("vjt", vjt.send("bot", {"t": "text", "body": "back"}))   # on the new session
     _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
                            sender_mask="vjt!vjt@host", line=LINE)
     ref = framing.parse(res.outbound[0][1]).msgid

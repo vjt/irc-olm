@@ -284,7 +284,7 @@ class Engine:
         self._keyreq_at: dict[str, float] = {}       # folded nick -> last KEYREQ
         self._keyreq_out: set[str] = set()           # folded nicks a KEYS is due from
         self._keys_at: dict[str, float] = {}         # folded nick -> last KEYS answer
-        self._rekey_at: dict[str, float] = {}        # folded nick -> last re-key or session opened
+        self._rekey_at: dict[str, float] = {}        # folded nick -> last re-key after a NACK
         self._rekey_due: dict[str, str] = {}         # folded nick -> nick: a re-key's KEYREQ waits
         self._rekeying: set[str] = set()             # device keys waiting for fresh keys
         self._listreq_at: dict[str, float] = {}      # folded nick -> last listreq sent
@@ -725,8 +725,7 @@ class Engine:
         if peer is not None:
             book = self._book(peer.master)
             self._revoke(book, book.apply(lst)[1])
-            if self._open_sessions(nick, book, entries, res):
-                self._rekey_at[key] = self._now()
+            self._open_sessions(nick, book, entries, res)
         self._keyreq_out.discard(key)
         queue = self._live_queue(key, res)
         self._outq.pop(key, None)
@@ -750,11 +749,10 @@ class Engine:
         done = q.done | self._encrypt(nick, peer, q.msg, ready, res) if ready else q.done
         return replace(q, done=done) if lacking else None
 
-    def _open_sessions(self, nick: str, book: Book, entries: list[dict], res: Result) -> int:
+    def _open_sessions(self, nick: str, book: Book, entries: list[dict], res: Result) -> None:
         """A session to each usable entry of a KEYS (trust rule 4 and a good
         one-time key signature) whose device has no working session; the
-        other one-time keys stay unused. Returns how many it opened."""
-        opened = 0
+        other one-time keys stay unused."""
         for e in entries:
             ident, otk = e["id"], e["otk"]
             reason = self._refusal(book, ident, cert=None, proving=False)
@@ -777,8 +775,6 @@ class Engine:
             self._bind_device(book, ident, proven=False, cert=None)
             self._add_session(ident["curve25519"], session)
             self._rekeying.discard(ident["ed25519"])
-            opened += 1
-        return opened
 
     def _on_pkmsg(self, nick: str, msg: Assembled, payload: dict, res: Result) -> None:
         ident = payload["id"]
