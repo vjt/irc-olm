@@ -449,15 +449,15 @@ class Engine:
         if book is None:
             return [], set()
         wanted = (book.wanted() if want is None else want & book.wanted()) - done
-        ready = [d for d in book.targets() if d.ed25519 in wanted and self._ready(book, d)]
+        ready = [d for d in book.targets() if d.ed25519 in wanted and self._ready(d)]
         return ready, wanted - {d.ed25519 for d in ready}
 
-    def _ready(self, book: Book, d: Device) -> bool:
-        """A trusted device with a session we may send on: none while keys
+    def _ready(self, d: Device) -> bool:
+        """Whether a device has a session we may send on: none while keys
         are asked for after it NACKed (the sessions we hold are the ones that
-        failed)."""
-        return (not book.revoked(d.ed25519) and d.ed25519 not in self._rekeying
-                and bool(self._sessions.get(d.curve25519)))
+        failed). Its callers hand it trusted devices only: Book.targets(),
+        and a KEYS entry Book.refusal() let through."""
+        return d.ed25519 not in self._rekeying and bool(self._sessions.get(d.curve25519))
 
     def _enqueue(self, nick: str, peer: Peer, msg: _Outgoing, res: Result, *,
                  want: frozenset[str] | None, done: frozenset[str]) -> None:
@@ -766,7 +766,7 @@ class Engine:
                 res.events.append(Dropped(nick, reason, "KEYS"))
                 continue
             d = book.device(ident["ed25519"])
-            if d is not None and self._ready(book, d):
+            if d is not None and self._ready(d):
                 continue
             try:
                 session = self._account.create_outbound_session(
