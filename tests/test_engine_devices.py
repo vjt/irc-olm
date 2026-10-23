@@ -193,12 +193,18 @@ def test_a_revoked_devices_lines_stay_refused_after_a_re_pin(net, how):
     bot.set_pins({})
     bot.set_pins({"alice": a0.fingerprint})
     net.take("bot")
+    n = len(net.wire)
     for i in range(3):
         net.pump("alice.1", a1.send("bot", text(f"still me {i}")))
         got = net.take("bot")
         assert texts(got) == [] and [e.reason for e in got if isinstance(e, Dropped)] == \
             ["revoked-device"]
         net.clock.t += 61
+    # The README's word: a re-pin forgets which device each sender key belongs
+    # to, so a line on an old session draws a NACK, as from any peer that lost
+    # its state; sent one at a time, only the first one does.
+    assert [f.verb for f in (framing.parse(b) for s, _, b in net.wire[n:] if s == "bot")
+            if f.verb == "NACK"] == ["NACK"]
 
 
 def test_forgetting_a_masters_sessions_forgets_every_devices(net):

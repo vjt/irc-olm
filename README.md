@@ -185,9 +185,13 @@ of `repr()`, but log lengths, never bodies.
   names the version of the first list that held its device, and speaks only
   until we hold that list or a newer one: from then on the list decides, and
   a device it does not hold is revoked. A list only moves forward (a higher
-  `ver`); a device a newer list drops is revoked for good: its sessions go,
-  nothing is encrypted to it again, and its lines are dropped without a
-  NACK. That memory survives a restart and a re-pin.
+  `ver`); a device a newer list drops is revoked until a later list holds
+  it again: its sessions go, nothing is encrypted to it again, and its
+  lines are dropped without a NACK. The revocation survives a restart and
+  a re-pin. A re-pin forgets which device each sender key belongs to,
+  though, so lines the device sends on an old session draw a NACK each, as
+  from any peer that lost its state; every pre-key message from it is
+  refused.
   `Received.device` names the device a message came from, and a message to a
   peer is one Olm message per nick with one body for each of its trusted
   devices (`engine.devices(master)`).
