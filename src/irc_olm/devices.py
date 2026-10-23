@@ -16,9 +16,10 @@ A `did` (device id) only addresses a line: nothing is trusted because of one.
 It is computed from a key already checked, never taken from the wire.
 
 `Book` is what a receiver keeps per master: the stored list (trust rule 3),
-every key it ever listed (so a revoked key is one listed once and not now,
-rule 5), and the curve of each device a session was bound to, with the
-version of its certificate if one was seen.
+every key it ever listed, in a list it accepted or in the one a
+certificate names once the stored list reaches it (so a revoked key is one
+listed once and not now, rule 5), and the curve of each device a session
+was bound to, with the version of its certificate if one was seen.
 """
 
 from __future__ import annotations
@@ -265,20 +266,20 @@ class Book:
         if lst.ver == self.ver:
             return (Change.SAME if new == self._listed else Change.CONFLICT), set()
         before = {ed for ed in self._listed | self._devices.keys() if not self.revoked(ed)}
-        self.ver, self._listed, self._ever = lst.ver, new, self._ever | new
+        # A certificate is its master's word that list N held the device, so
+        # a list at N or newer has listed it as surely as one we saw.
+        passed = {ed for ed, d in self._devices.items()
+                  if d.cert_ver is not None and d.cert_ver <= lst.ver}
+        self.ver, self._listed, self._ever = lst.ver, new, self._ever | new | passed
         return Change.REPLACED, {ed for ed in before if self.revoked(ed)}
 
     def listed(self, ed25519: str) -> bool:
         return ed25519 in self._listed
 
     def revoked(self, ed25519: str) -> bool:
-        """Listed once and not now (rule 5), or certified for a version the
-        stored list has reached without listing it."""
-        if ed25519 in self._listed:
-            return False
-        d = self._devices.get(ed25519)
-        return ed25519 in self._ever or (d is not None and d.cert_ver is not None
-                                         and d.cert_ver <= self.ver)
+        """Listed once and not now (rule 5): by a list we accepted, or by the
+        one its certificate names, once the stored list has reached it."""
+        return ed25519 in self._ever and ed25519 not in self._listed
 
     def refusal(self, ident: dict, *, cert: Cert | None) -> str | None:
         """Why a device may not be bound under this master, or None: its id

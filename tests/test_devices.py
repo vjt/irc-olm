@@ -646,6 +646,15 @@ def test_a_list_reaching_a_certified_devices_version_without_it_revokes_it(maste
         "revoked-device"
     # Only a fresh list moves it: one at the same version, or older, does not.
     assert book.apply(lst(master, ver, [ed(a)])) == (Change.SAME, set())
+    # The certificate is the master's word that list 3 held b: the list that
+    # dropped it is remembered, an unpin included, and no certificate brings
+    # it back.
+    book.forget_devices()
+    assert book.revoked(ed(b))
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, ver + 1, ed(b))) == \
+        "revoked-device"
+    assert book.apply(lst(master, ver + 1, sorted([ed(a), ed(b)]))) == (Change.REPLACED, set())
+    assert not book.revoked(ed(b))                # a list holding it again does
 
 
 def test_a_certified_device_dropped_by_a_later_list_is_revoked(master):

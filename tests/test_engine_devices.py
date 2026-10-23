@@ -174,6 +174,33 @@ def test_a_list_passing_a_certified_devices_version_without_it_revokes_it(net):
     assert texts(net.take("alice.0")) == ["for alice"] and texts(net.take("alice.1")) == []
 
 
+@pytest.mark.parametrize("how", ["dropped", "certified"])
+def test_a_revoked_devices_lines_stay_refused_after_a_re_pin(net, how):
+    bot, (a0, a1) = setup(net)
+    if how == "certified":
+        net.relist("alice", [a0], 1)
+    net.pump("bot", bot.send("alice", text("hi")))
+    if how == "certified":
+        net.relist("alice", [a0, a1], 2)
+        net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
+        net.pump("alice.1", a1.send("bot", text("new laptop")))   # on its certificate
+        net.drop = None
+        net.pump("bot", bot.send("alice", text("to both")))       # so a1 now writes MSGs
+    net.relist("alice", [a0], 3)
+    net.clock.t += 61
+    net.pump("alice.0", a0.send("bot", text("news")))
+    assert bot._books[a0.fingerprint].ver == 3
+    bot.set_pins({})
+    bot.set_pins({"alice": a0.fingerprint})
+    net.take("bot")
+    for i in range(3):
+        net.pump("alice.1", a1.send("bot", text(f"still me {i}")))
+        got = net.take("bot")
+        assert texts(got) == [] and [e.reason for e in got if isinstance(e, Dropped)] == \
+            ["revoked-device"]
+        net.clock.t += 61
+
+
 def test_forgetting_a_masters_sessions_forgets_every_devices(net):
     bot, devs = setup(net, 3)
     net.pump("bot", bot.send("alice", text("hi")))
