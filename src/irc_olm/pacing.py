@@ -59,7 +59,7 @@ from collections import deque
 from enum import IntEnum
 from itertools import count, islice
 from math import inf
-from typing import Callable, Mapping, NamedTuple
+from typing import AbstractSet, Callable, Mapping, NamedTuple
 
 from . import framing
 from .framing import fold
@@ -128,7 +128,7 @@ BUDGET_WINDOW = 60.0
 # reserve ahead of them all, and pays for the rest of it, once, from URGENT's
 # allowance: one first contact a minute while the orders are at their budget.
 # Its asker asks again at KEYREQ_RETRY (30 s) and drops what it queued at
-# OUTQ_TTL (60 s). A NACK has no asker waiting (its sender keeps the message
+# OUTQ_TTL (90 s for a bot). A NACK has no asker waiting (its sender keeps the message
 # SENT_MEMORY) and never goes ahead of the orders.
 FRESH_PATIENCE = 8.0
 # Text queued and no text line released for this long: a text message under
@@ -161,14 +161,16 @@ class Lane(IntEnum):
     TEXT = 2
 
 
-def lane_of(body: str, urgent: Mapping[str, float | None]) -> Lane:
+def lane_of(body: str, urgent: Mapping[str, float | None], reactive: AbstractSet[str]) -> Lane:
     """The lane for a CTCP body from an Engine Result: KEYS and NACK are
-    REACTIVE whatever the engine says, the msgids in `urgent` (the KEYREQs,
-    the messages carrying a CHAL or an ACK) URGENT, everything else TEXT."""
+    REACTIVE whatever the engine says, and so are the msgids in `reactive`
+    (a listreq, a t:list: what a peer draws from us inside Olm); the msgids
+    in `urgent` (the KEYREQs, the messages carrying a CHAL or an ACK) are
+    URGENT, everything else TEXT."""
     frag = framing.parse(body)
     if frag is None:
         return Lane.TEXT
-    if frag.verb in REACTIVE_VERBS:
+    if frag.verb in REACTIVE_VERBS or frag.msgid in reactive:
         return Lane.REACTIVE
     return Lane.URGENT if frag.msgid in urgent else Lane.TEXT
 
@@ -809,9 +811,10 @@ class PacedSender:
             self._alive()
             return self._pacer.room(target)
 
-    def submit_all(self, outbound: list[tuple[str, str]],
-                   urgent: Mapping[str, float | None]) -> list[tuple[str, str]]:
-        """Submit an Engine Result: `submit_all(result.outbound, result.urgent)`.
+    def submit_all(self, outbound: list[tuple[str, str]], urgent: Mapping[str, float | None],
+                   reactive: AbstractSet[str]) -> list[tuple[str, str]]:
+        """Submit an Engine Result:
+        `submit_all(result.outbound, result.urgent, result.reactive)`.
         Each message (a msgid's fragments) is queued or refused whole, in
         order within its target and lane; a CHAL gets the deadline its
         seconds in `urgent` name. Every refusal is logged; returns (target,
@@ -831,7 +834,7 @@ class PacedSender:
         for (target, _), (msgid, lines) in messages.items():
             ttl = urgent.get(msgid) if msgid is not None else None
             frag = framing.parse(lines[0])
-            if (not self.submit(target, lines, lane=lane_of(lines[0], urgent),
+            if (not self.submit(target, lines, lane=lane_of(lines[0], urgent, reactive),
                                 deadline=None if ttl is None else now + ttl)
                     and frag is not None and frag.verb in OLM_VERBS):
                 refused.append((target, msgid))

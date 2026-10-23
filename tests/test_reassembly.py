@@ -1,8 +1,11 @@
+from dataclasses import replace
+
 from irc_olm import framing
 from irc_olm.framing import Fragment
 from irc_olm.reassembly import Assembled, Reassembler, Rejected
 
 MASK = "bot!b@host"
+SRC, DST = "AbCdEfGh-_0", "_Uw_z3-OAsk"
 
 
 class Clock:
@@ -14,9 +17,9 @@ class Clock:
 
 
 def frags(size, verb="MSG"):
-    payload = framing.encode_payload({"v": 1, "body": "x" * size})
+    payload = framing.encode_payload({"v": 2, "body": "x" * size})
     return payload, [framing.parse(b) for b in
-                     framing.fragment(verb, payload, own_mask=MASK, target="vjt")]
+                     framing.fragment(verb, payload, src=SRC, dst=DST, own_mask=MASK, target="vjt")]
 
 
 def make(**kw):
@@ -27,7 +30,7 @@ def make(**kw):
 def test_single_fragment_completes_at_once():
     r, _ = make()
     payload, (f,) = frags(10)
-    assert r.feed("vjt", f) == Assembled("MSG", f.msgid, payload)
+    assert r.feed("vjt", f) == Assembled("MSG", f.msgid, SRC, DST, payload)
 
 
 def test_out_of_order_fragments_reassemble():
@@ -37,7 +40,7 @@ def test_out_of_order_fragments_reassemble():
     order = fs[::-1]
     for f in order[:-1]:
         assert r.feed("vjt", f) is None
-    assert r.feed("vjt", order[-1]) == Assembled("MSG", fs[0].msgid, payload)
+    assert r.feed("vjt", order[-1]) == Assembled("MSG", fs[0].msgid, SRC, DST, payload)
 
 
 def test_same_msgid_from_two_senders_does_not_mix():
@@ -46,7 +49,7 @@ def test_same_msgid_from_two_senders_does_not_mix():
     for f in fs[:-1]:
         r.feed("alice", f)
     assert r.feed("bob", fs[-1]) is None
-    assert r.feed("alice", fs[-1]) == Assembled("MSG", fs[0].msgid, payload)
+    assert r.feed("alice", fs[-1]) == Assembled("MSG", fs[0].msgid, SRC, DST, payload)
 
 
 def test_incomplete_message_is_discarded_after_60s():
@@ -68,12 +71,23 @@ def test_message_completing_inside_60s_survives():
     assert r.feed("vjt", fs[-1]).payload == payload
 
 
+def test_a_fragment_from_or_to_another_device_rejects_the_message():
+    for field, other in (("src", "zzzzzzzzzzz"), ("dst", "*")):
+        r, _ = make()
+        _, fs = frags(1000)
+        r.feed("vjt", fs[0])
+        assert r.feed("vjt", replace(fs[1], **{field: other})) == Rejected(
+            fs[0].msgid, "inconsistent-fragment", "MSG")
+        for g in fs[1:]:
+            assert not isinstance(r.feed("vjt", g), Assembled)
+
+
 def test_verb_or_total_mismatch_rejects_the_message():
     r, _ = make()
     _, fs = frags(1000)
     r.feed("vjt", fs[0])
     f = fs[1]
-    assert isinstance(r.feed("vjt", Fragment("PKMSG", f.msgid, f.index, f.total, f.chunk)), Rejected)
+    assert isinstance(r.feed("vjt", replace(f, verb="PKMSG")), Rejected)
     # the whole message is gone, not just the bad fragment
     for g in fs[1:]:
         assert not isinstance(r.feed("vjt", g), Assembled)
@@ -94,7 +108,7 @@ def test_per_sender_byte_cap():
     assert not any(isinstance(x, Assembled) for x in results)
     # another sender is unaffected
     payload, small = frags(10)
-    assert r.feed("other", small[0]) == Assembled("MSG", small[0].msgid, payload)
+    assert r.feed("other", small[0]) == Assembled("MSG", small[0].msgid, SRC, DST, payload)
 
 
 def test_per_sender_pending_message_cap():
@@ -110,7 +124,7 @@ def test_bytes_are_released_when_a_message_completes():
     for _ in range(5):
         payload, fs = frags(600)
         results = [r.feed("vjt", f) for f in fs]
-        assert results[-1] == Assembled("MSG", fs[0].msgid, payload)
+        assert results[-1] == Assembled("MSG", fs[0].msgid, SRC, DST, payload)
 
 
 def test_a_slow_message_survives_while_its_fragments_keep_coming():
@@ -175,7 +189,7 @@ def test_the_global_cap_takes_from_the_sender_holding_the_most_first():
 def test_the_global_cap_takes_the_victims_message_furthest_from_completion():
     # Not its idlest: paced, that is the one closest to done.
     r, clock = make(max_bytes_total=3000)
-    _, near = frags(1500)
+    _, near = frags(2000)    # 4 full chunks of 5: closest to done
     _, far = frags(3000)
     for f in near[:-1]:
         assert r.feed("mal", f) is None

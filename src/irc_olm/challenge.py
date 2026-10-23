@@ -3,8 +3,9 @@
 An order given outside the encrypted query (in a channel, or in a plaintext
 query) is bound to the exact line: the bot sends a CHAL inside the verified
 session, and the human's client answers ACK only if it sent exactly that line
-there in the last 15 s. The bot accepts iff the ACK comes back on the same
-verified key, with an unused nonce, before it expires. Spec: grappa-irc#2430,
+there in the last 15 s. The bot accepts iff the ACK comes back from a device
+of the same master (wire v2: any of its trusted devices may answer), with an
+unused nonce, before it expires. Spec: grappa-irc#2430,
 "Authorising orders"; 15 s is vjt's decision 5.
 """
 
@@ -22,7 +23,7 @@ CHALLENGE_TTL = 15
 class Challenge:
     nonce: str
     nick: str
-    ed25519: str
+    master: str
     network: str
     channel: str
     sender_mask: str
@@ -35,10 +36,10 @@ class Challenge:
                 "nonce": self.nonce, "expires_at": self.expires_at}
 
 
-def new_challenge(*, nick: str, ed25519: str, network: str, channel: str,
+def new_challenge(*, nick: str, master: str, network: str, channel: str,
                   sender_mask: str, line: bytes, now: float) -> Challenge:
     nonce = base64.b64encode(os.urandom(16)).decode().rstrip("=")
-    return Challenge(nonce, nick, ed25519, network, channel, sender_mask,
+    return Challenge(nonce, nick, master, network, channel, sender_mask,
                      hashlib.sha256(line).hexdigest(), int(now) + CHALLENGE_TTL)
 
 
@@ -51,12 +52,12 @@ class ChallengeBook:
     def add(self, ch: Challenge) -> None:
         self._pending[ch.nonce] = ch
 
-    def check(self, nonce: str, ed25519: str, now: float) -> tuple[Challenge | None, str | None]:
+    def check(self, nonce: str, master: str, now: float) -> tuple[Challenge | None, str | None]:
         """(challenge, None) when the ACK is good, (None, reason) otherwise."""
         ch = self._pending.get(nonce)
         if ch is None:
             return None, "unknown-nonce"
-        if ch.ed25519 != ed25519:
+        if ch.master != master:
             return None, "wrong-peer"   # the nonce stays usable by its owner
         del self._pending[nonce]
         if now > ch.expires_at:
