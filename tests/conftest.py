@@ -70,10 +70,15 @@ class Net:
         return devs
 
     def relist(self, nick, keep, ver):
-        """The user's master signs a new list holding the devices `keep`."""
-        from irc_olm.devices import sign_master
+        """The user's master signs a new list holding the devices `keep`, and
+        a certificate at `ver` for each one the last list did not hold:
+        pairing a device is what puts it on a list."""
+        from irc_olm.devices import sign_cert, sign_master
         devs = self.devices[nick]
         block = sign_master(devs[0]._master, ver, [d.device_key for d in keep])
+        for d in keep:
+            if d.device_key not in self.listed.get(nick, set()):
+                d._cert = sign_cert(devs[0]._master, ver, d.device_key)
         for d in devs:
             d._ver, d._own_block = ver, block
         self.listed[nick] = {d.device_key for d in keep}

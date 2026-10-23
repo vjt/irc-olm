@@ -118,6 +118,62 @@ def test_a_device_the_list_does_not_hold_yet_is_trusted_on_its_certificate(net):
     assert [texts(net.take(f"alice.{i}"))[-1] for i in range(3)] == ["welcome"] * 3
 
 
+def test_a_cert_no_newer_than_the_list_the_bot_holds_trusts_no_unlisted_device(net):
+    bot, (a0, a1) = setup(net)
+    net.relist("alice", [a0], 1)
+    net.pump("bot", bot.send("alice", text("hi")))
+    net.relist("alice", [a0, a1], 2)              # a1 paired at 2, dropped at 3:
+    net.relist("alice", [a0], 3)                  # the bot sees neither list yet
+    net.pump("alice.0", a0.send("bot", text("news")))
+    assert bot._books[a0.fingerprint].ver == 3
+    net.take("bot")
+    net.pump("alice.1", a1.send("bot", text("it is me")))
+    got = net.take("bot")
+    assert texts(got) == [] and "stale-certificate" in [e.reason for e in got if isinstance(e, Dropped)]
+    assert a1.device_key not in {d.ed25519 for d in bot.devices(a0.fingerprint)}
+    net.take("alice.0"), net.take("alice.1")
+    net.pump("bot", bot.send("alice", text("for alice")))
+    assert texts(net.take("alice.0")) == ["for alice"] and texts(net.take("alice.1")) == []
+
+
+def test_a_list_passing_a_certified_devices_version_without_it_revokes_it(net):
+    from irc_olm.engine import REKEY_INTERVAL
+    bot, (a0, a1) = setup(net)
+    net.relist("alice", [a0], 1)
+    net.pump("bot", bot.send("alice", text("hi")))
+    net.relist("alice", [a0, a1], 2)
+    # a1 writes on its certificate; the list it would bring never arrives.
+    net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
+    net.pump("alice.1", a1.send("bot", text("new laptop")))
+    net.drop = None
+    assert texts(net.take("bot")) == ["new laptop"]
+    assert bot._sessions.get(a1.identity["curve25519"])
+    n = len(net.wire)
+    net.pump("bot", bot.send("alice", text("to both")))
+    assert texts(net.take("alice.1"))[-1:] == ["to both"]
+    ref = [framing.parse(b).msgid for s, _, b in net.wire[n:]
+           if s == "bot" and framing.parse(b).verb == "MSG"][0]
+    net.relist("alice", [a0], 3)
+    net.clock.t += 61                             # past the listreq minute a1 used
+    net.pump("alice.0", a0.send("bot", text("news")))
+    assert bot._books[a0.fingerprint].ver == 3
+    assert not bot._sessions.get(a1.identity["curve25519"])
+    assert a1.device_key not in {d.ed25519 for d in bot.devices(a0.fingerprint)}
+    net.take("bot"), net.take("alice.0"), net.take("alice.1")
+    n = len(net.wire)
+    net.pump("alice.1", a1.send("bot", text("still me")))
+    got = net.take("bot")
+    assert texts(got) == [] and [e.reason for e in got if isinstance(e, Dropped)] == ["revoked-device"]
+    assert [f.verb for f in (framing.parse(b) for s, _, b in net.wire[n:] if s == "bot")
+            if f.verb == "NACK"] == []              # like a dropped key: no NACK
+    net.clock.t += REKEY_INTERVAL
+    res = net.inject("alice.1", "bot", "NACK", {"v": 2, "ref": ref})
+    assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["revoked-device"]
+    assert not [e for e in res.events if isinstance(e, Rekeying)] and res.outbound == []
+    net.pump("bot", bot.send("alice", text("for alice")))
+    assert texts(net.take("alice.0")) == ["for alice"] and texts(net.take("alice.1")) == []
+
+
 def test_forgetting_a_masters_sessions_forgets_every_devices(net):
     bot, devs = setup(net, 3)
     net.pump("bot", bot.send("alice", text("hi")))

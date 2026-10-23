@@ -79,7 +79,7 @@ def test_payloads_match_the_wire_spec(net):
     assert set(entry["otk"]) == {"key", "fallback", "sig"} and entry["otk"]["fallback"] is False
     pk = by_verb["PKMSG"]
     assert set(pk) == {"v", "id", "master", "bodies"} and pk["id"] == vjt.identity
-    assert pk["master"] == {"ed25519": vjt.fingerprint, "cert": pk["master"]["cert"]}
+    assert pk["master"] == {"ed25519": vjt.fingerprint, "ver": 1, "cert": pk["master"]["cert"]}
     assert set(pk["bodies"]) == {bot.did}
     assert set(by_verb["MSG"]) == {"v", "ck", "bodies"} and set(by_verb["MSG"]["bodies"]) == {vjt.did}
     assert by_verb["MSG"]["ck"] == bot.identity["curve25519"]

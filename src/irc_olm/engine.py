@@ -37,8 +37,8 @@ import vodozemac as vz
 
 from . import framing
 from .challenge import Challenge, ChallengeBook, new_challenge
-from .devices import (MAX_DEVICES, Book, Device, InvalidBlock, binding, cert_ok, did, id_block,
-                      id_ok, parse_keys, parse_master, parse_master_ref, sign_cert,
+from .devices import (MAX_DEVICES, Book, Cert, Device, InvalidBlock, binding, cert_ok, did,
+                      id_block, id_ok, parse_keys, parse_master, parse_master_ref, sign_cert,
                       sign_master, wire_int)
 from .framing import PayloadError, fold
 from .keys import b64, ed25519_key, is_key, sig_ok, unb64
@@ -339,7 +339,7 @@ class Engine:
     def master_ref(self) -> dict:
         """Our master and its certificate for this device, as a PKMSG
         carries them."""
-        return {"ed25519": self._master_key, "cert": self._cert}
+        return {"ed25519": self._master_key, "ver": self._cert.ver, "cert": self._cert.sig}
 
     def set_own_mask(self, mask: str) -> None:
         with self._lock:
@@ -1116,7 +1116,7 @@ class Engine:
 
     # --- identities and pins -------------------------------------------------
 
-    def _master_peer(self, nick: str, ident: dict, master: str, cert: str,
+    def _master_peer(self, nick: str, ident: dict, master: str, cert: Cert,
                      res: Result) -> Peer | None:
         """The pinned peer a PKMSG's master names, under any nick. Otherwise
         None: ignored, never answered, and a KeyAlarm when `nick` is pinned
@@ -1147,7 +1147,7 @@ class Engine:
                 self._sessions.pop(d.curve25519, None)
             self._rekeying.discard(ed)
 
-    def _refusal(self, book: Book, ident: dict, *, cert: str | None,
+    def _refusal(self, book: Book, ident: dict, *, cert: Cert | None,
                  proving: bool) -> str | None:
         """Why an id block's device may not be bound under `book`'s master
         (Book.refusal), or None. And v1's curve rules on top.
@@ -1183,7 +1183,7 @@ class Engine:
         return None
 
     def _bind_device(self, book: Book, ident: dict, *, proven: bool,
-                     cert: str | None) -> Device:
+                     cert: Cert | None) -> Device:
         """Store the curve a session was opened on; `proven` when a pre-key
         message decrypted on it. A proof evicts another device's claim on
         that curve, sessions included (_refusal let it through only if
@@ -1209,13 +1209,14 @@ class Engine:
     # --- crypto helpers ------------------------------------------------------
 
     def _own_blocks(self) -> None:
-        """What we sign once: the id block, our list and our certificate."""
+        """What we sign once: the id block, our list and our certificate,
+        at our list's version (every list of ours holds this device)."""
         self._device_key = self._account.ed25519_key.to_base64()
         self._master_key = self._master.ed25519_key.to_base64()
         self._did = did(self._device_key)
         self._id_block = id_block(self._account, self._master_key)
         self._own_block = sign_master(self._master, self._ver, [self._device_key])
-        self._cert = sign_cert(self._master, self._device_key)
+        self._cert = sign_cert(self._master, self._ver, self._device_key)
 
     def _sign(self, text: str) -> str:
         return self._account.sign(text.encode()).to_base64()

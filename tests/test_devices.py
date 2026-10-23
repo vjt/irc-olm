@@ -6,7 +6,7 @@ import pytest
 import vodozemac as vz
 
 from irc_olm import devices
-from irc_olm.devices import (MAX_DEVICES, Book, Change, DeviceList, InvalidBlock, binding,
+from irc_olm.devices import (MAX_DEVICES, Book, Cert, Change, DeviceList, InvalidBlock, binding,
                              cert_ok, cert_text, did, id_block, id_ok, list_text, parse_keys,
                              parse_master, parse_master_ref, sign_cert, sign_master, wire_int)
 
@@ -283,29 +283,38 @@ def test_a_malformed_id_block_does_not_verify(master, mangle):
 # --- the device certificate and the PKMSG's master block --------------------
 
 def test_cert_text_is_the_signed_string():
-    assert cert_text(RFC_KEY_1) == "irc-e2e:v2:dev:" + RFC_KEY_1
+    assert cert_text(3, RFC_KEY_1) == "irc-e2e:v2:dev:3:" + RFC_KEY_1
 
 
-def test_a_cert_verifies_under_its_master_for_its_device(master):
+def test_a_cert_verifies_under_its_master_for_its_device_and_version(master):
     dev = vz.Account()
-    c = sign_cert(master, ed(dev))
-    assert cert_ok(m_key(master), ed(dev), c)
+    c = sign_cert(master, 2, ed(dev))
+    assert c.ver == 2 and cert_ok(m_key(master), ed(dev), c)
     assert not cert_ok(m_key(vz.Account()), ed(dev), c)         # another master
     assert not cert_ok(m_key(master), ed(vz.Account()), c)      # another device
-    assert not cert_ok(m_key(master), ed(dev), c + "A")
-    assert not cert_ok(m_key(master), ed(dev), None)
+    assert not cert_ok(m_key(master), ed(dev), Cert(3, c.sig))  # another version
+    assert not cert_ok(m_key(master), ed(dev), Cert(2, c.sig + "A"))
+    assert not cert_ok(m_key(master), ed(dev), Cert(2, None))
+
+
+def test_sign_cert_takes_only_a_version_the_wire_carries(master):
+    for ver in (0, 2**31, True, 1.0, "1"):
+        with pytest.raises(ValueError):
+            sign_cert(master, ver, ed(vz.Account()))
 
 
 def test_a_list_signature_is_not_a_cert(master):
     dev = vz.Account()
     block = sign_master(master, 1, [ed(dev)])
-    assert not cert_ok(m_key(master), ed(dev), block["sig"])
+    assert not cert_ok(m_key(master), ed(dev), Cert(1, block["sig"]))
 
 
 def test_the_pkmsg_master_block_parses_into_its_key_and_cert(master):
     dev = vz.Account()
-    c = sign_cert(master, ed(dev))
-    assert parse_master_ref({"ed25519": m_key(master), "cert": c, "x": 1}) == (m_key(master), c)
+    c = sign_cert(master, 2, ed(dev))
+    block = {"ed25519": m_key(master), "ver": 2, "cert": c.sig, "x": 1}
+    assert parse_master_ref(block) == (m_key(master), c)
+    assert parse_master_ref({**block, "ver": 2.0}) == (m_key(master), c)
 
 
 @pytest.mark.parametrize("mangle", [
@@ -315,9 +324,16 @@ def test_the_pkmsg_master_block_parses_into_its_key_and_cert(master):
     lambda b: {k: v for k, v in b.items() if k != "cert"},
     lambda b: {**b, "cert": 7},
     lambda b: {**b, "cert": b["cert"][:-1]},
+    lambda b: {k: v for k, v in b.items() if k != "ver"},
+    lambda b: {**b, "ver": 0},
+    lambda b: {**b, "ver": 2**31},
+    lambda b: {**b, "ver": True},
+    lambda b: {**b, "ver": "1"},
+    lambda b: {**b, "ver": 1.5},
 ])
 def test_a_malformed_pkmsg_master_block_does_not_parse(master, mangle):
-    block = {"ed25519": m_key(master), "cert": sign_cert(master, ed(vz.Account()))}
+    c = sign_cert(master, 1, ed(vz.Account()))
+    block = {"ed25519": m_key(master), "ver": c.ver, "cert": c.sig}
     with pytest.raises(InvalidBlock):
         parse_master_ref(mangle(block))
 
@@ -538,22 +554,26 @@ def test_an_empty_book_takes_its_first_list_and_certified_devices(master):
     book = Book.empty(m_key(master))
     assert book.ver == 0 and book.wanted() == set()
     assert book.refusal(id_block(a, m_key(master)), cert=None) == "unlisted-device"
-    book.bind(id_block(a, m_key(master)), proven=True, cert=sign_cert(master, ed(a)))
+    book.bind(id_block(a, m_key(master)), proven=True, cert=sign_cert(master, 2, ed(a)))
     assert book.wanted() == {ed(a)}
     assert book.apply(lst(master, 1, [ed(b)])) == (Change.REPLACED, set())
-    assert book.wanted() == {ed(a), ed(b)}       # certified, and never revoked
+    assert book.wanted() == {ed(a), ed(b)}       # certified for a list newer than 1
 
 
 def test_refusal_names_each_rule(master):
     book, (a, b) = bound(master, 2)
     other = vz.Account()
     assert book.refusal(id_block(a, m_key(other)), cert=None) == "bad-identity-signature"
-    assert book.refusal(id_block(other, m_key(master)), cert=sign_cert(vz.Account(), ed(other))) \
-        == "bad-certificate"
+    assert book.refusal(id_block(other, m_key(master)),
+                        cert=sign_cert(vz.Account(), 2, ed(other))) == "bad-certificate"
+    assert book.refusal(id_block(other, m_key(master)), cert=sign_cert(master, 1, ed(other))) \
+        == "stale-certificate"
+    assert book.refusal(id_block(other, m_key(master)),          # unverified, so no version
+                        cert=sign_cert(vz.Account(), 1, ed(other))) == "bad-certificate"
     assert book.refusal({**id_block(a, m_key(master)), "curve25519": curve(other)}, cert=None) \
         in ("bad-identity-signature", "identity-curve-mismatch")
     book.apply(lst(master, 2, [ed(a)]))
-    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, ed(b))) == \
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, 3, ed(b))) == \
         "revoked-device"
     assert book.refusal(id_block(a, m_key(master)), cert=None) is None
 
@@ -569,8 +589,10 @@ def test_forgetting_devices_keeps_the_list_and_its_revocations(master):
 def test_bind_takes_an_unlisted_device_its_master_certified(master):
     book, (a,) = bound(master, 1)
     b = vz.Account()                           # paired after the list we hold
-    d = book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
-    assert d.certified and not book.listed(ed(b))
+    d = book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, 2, ed(b)))
+    assert d.cert_ver == 2 and not book.listed(ed(b))
+    book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, 3, ed(b)))
+    assert book.device(ed(b)).cert_ver == 2      # the first certificate stays
     assert {x.ed25519 for x in book.targets()} == {ed(a), ed(b)}
     assert book.bound(curve(b)).ed25519 == ed(b)
 
@@ -579,24 +601,59 @@ def test_bind_refuses_a_cert_that_does_not_verify(master):
     book, _ = bound(master, 1)
     b = vz.Account()
     with pytest.raises(ValueError):
-        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(vz.Account(), ed(b)))
+        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(vz.Account(), 2, ed(b)))
     assert book.device(ed(b)) is None
 
 
 def test_a_revoked_device_is_not_trusted_on_its_cert(master):
     book, (a, b) = bound(master, 2)
     book.apply(lst(master, 2, [ed(a)]))
-    with pytest.raises(ValueError):
-        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
+    with pytest.raises(ValueError):           # even on a certificate newer than the list
+        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, 3, ed(b)))
     assert ed(b) not in {x.ed25519 for x in book.targets()}
+
+
+@pytest.mark.parametrize("ver", [1, 2, 3])
+def test_a_cert_no_newer_than_the_stored_list_trusts_no_unlisted_device(master, ver):
+    # The stored list is the master's word on the devices up to its version:
+    # a certificate for that version or an older one has nothing to add.
+    book, (a,) = bound(master, 1, ver=3)
+    b = vz.Account()
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, ver, ed(b))) == \
+        "stale-certificate"
+    with pytest.raises(ValueError):
+        book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ver, ed(b)))
+    assert book.device(ed(b)) is None
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, 4, ed(b))) is None
+
+
+def test_a_listed_device_is_trusted_whatever_its_cert_says(master):
+    book, (a,) = bound(master, 1, ver=3)
+    assert book.refusal(id_block(a, m_key(master)), cert=sign_cert(master, 1, ed(a))) is None
+
+
+@pytest.mark.parametrize("ver", [3, 5])
+def test_a_list_reaching_a_certified_devices_version_without_it_revokes_it(master, ver):
+    book, (a,) = bound(master, 1)
+    b = vz.Account()
+    book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, 3, ed(b)))
+    assert book.apply(lst(master, 2, [ed(a)])) == (Change.REPLACED, set())
+    assert not book.revoked(ed(b)) and ed(b) in book.wanted()
+    assert book.apply(lst(master, ver, [ed(a)])) == (Change.REPLACED, {ed(b)})
+    assert book.revoked(ed(b))
+    assert [x.ed25519 for x in book.targets()] == [ed(a)] and book.wanted() == {ed(a)}
+    assert book.refusal(id_block(b, m_key(master)), cert=sign_cert(master, 3, ed(b))) == \
+        "revoked-device"
+    # Only a fresh list moves it: one at the same version, or older, does not.
+    assert book.apply(lst(master, ver, [ed(a)])) == (Change.SAME, set())
 
 
 def test_a_certified_device_dropped_by_a_later_list_is_revoked(master):
     book, (a,) = bound(master, 1)
     b = vz.Account()
-    book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, ed(b)))
-    book.apply(lst(master, 2, sorted([ed(a), ed(b)])))
-    book.apply(lst(master, 3, [ed(a)]))
+    book.bind(id_block(b, m_key(master)), proven=True, cert=sign_cert(master, 2, ed(b)))
+    assert book.apply(lst(master, 2, sorted([ed(a), ed(b)]))) == (Change.REPLACED, set())
+    assert book.apply(lst(master, 3, [ed(a)])) == (Change.REPLACED, {ed(b)})
     assert book.revoked(ed(b))
     assert [x.ed25519 for x in book.targets()] == [ed(a)]
 
@@ -654,6 +711,10 @@ def test_a_book_survives_a_round_trip(master):
     assert [d for d in again.targets()] == [d for d in book.targets()]
     assert again.revoked(ed(c)) and again.bound(curve(c)).ed25519 == ed(c)
     assert again.device(ed(a)).proven
-    d = vz.Account()
-    book.bind(id_block(d, m_key(master)), proven=True, cert=sign_cert(master, ed(d)))
-    assert Book.from_doc(book.to_doc()).device(ed(d)).certified
+    d, e = vz.Account(), vz.Account()
+    book.bind(id_block(d, m_key(master)), proven=True, cert=sign_cert(master, 3, ed(d)))
+    book.bind(id_block(e, m_key(master)), proven=True, cert=sign_cert(master, 4, ed(e)))
+    book.apply(lst(master, 3, sorted([ed(a), ed(b)])))
+    again = Book.from_doc(book.to_doc())
+    assert again.device(ed(e)).cert_ver == 4 and not again.revoked(ed(e))
+    assert again.device(ed(d)).cert_ver == 3 and again.revoked(ed(d))

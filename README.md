@@ -181,10 +181,13 @@ of `repr()`, but log lengths, never bodies.
 - **Devices.** A peer's device is trusted when its id block, signed by the
   device, covers its curve and its master (so no other master can claim it),
   and when the master lists it (KEYS) or certified it (a PKMSG, before the
-  list says so) and never dropped it from a list we accepted. A list only
-  moves forward (a higher `ver`); a device a newer list drops is revoked for
-  good: its sessions go, nothing is encrypted to it again, and its lines are
-  dropped without a NACK. That memory survives a restart and a re-pin.
+  list says so) and never dropped it from a list we accepted. A certificate
+  names the version of the first list that held its device, and speaks only
+  until we hold that list or a newer one: from then on the list decides, and
+  a device it does not hold is revoked. A list only moves forward (a higher
+  `ver`); a device a newer list drops is revoked for good: its sessions go,
+  nothing is encrypted to it again, and its lines are dropped without a
+  NACK. That memory survives a restart and a re-pin.
   `Received.device` names the device a message came from, and a message to a
   peer is one Olm message per nick with one body for each of its trusted
   devices (`engine.devices(master)`).

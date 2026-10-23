@@ -56,7 +56,8 @@ def test_a_pkmsg_from_an_unpinned_master_keeps_nothing_whatever_its_body(net, bo
     assert eve.fingerprint not in bot._books and res.outbound == []
 
 
-@pytest.mark.parametrize("forged", ["id-signature", "certificate", "id-of-another-master"])
+@pytest.mark.parametrize("forged", ["id-signature", "certificate", "certificate-version",
+                                    "id-of-another-master"])
 def test_a_pkmsg_that_fails_its_own_signatures_is_no_alarm(net, forged):
     # Anyone can type a master key next to junk: an alarm is for a block that
     # holds together under the master it presents.
@@ -67,6 +68,8 @@ def test_a_pkmsg_that_fails_its_own_signatures_is_no_alarm(net, forged):
         ident["sig"] = mallory.identity["sig"]
     elif forged == "certificate":
         ref["cert"] = mallory.master_ref["cert"]
+    elif forged == "certificate-version":
+        ref["ver"] += 1
     else:
         ident = mallory.identity
     pk = {"v": 2, "id": ident, "master": ref, "bodies": {bot.did: "AAAA"}}
@@ -426,7 +429,7 @@ def test_an_ed25519_key_of_33_bytes_is_dropped_not_a_panic(net, verb):
         payload = {"v": 2, "master": net.engines["vjt"].master_block,
                    "devices": [{"id": ident, "otk": {"key": "A", "fallback": True, "sig": "A"}}]}
     else:
-        payload = {"v": 2, "id": ident, "master": {"ed25519": ed, "cert": "A" * 86},
+        payload = {"v": 2, "id": ident, "master": {"ed25519": ed, "ver": 1, "cert": "A" * 86},
                    "bodies": {bot.did: "A"}}
     res = net.inject("vjt" if verb == "KEYS" else "mallory", "bot", verb, payload)
     assert [e for e in res.events if isinstance(e, Dropped)]
