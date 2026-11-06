@@ -2,6 +2,8 @@
 `listreq` it draws, the `t:list` answering it; and order challenges to a
 user with several devices (amendment O1)."""
 
+import pytest
+
 from irc_olm import framing
 from irc_olm.engine import (AckOk, AckRejected, Dropped, KeyAlarm, Received, Result)
 
@@ -139,6 +141,75 @@ def test_a_list_signed_by_another_master_is_the_alarm(net):
     assert bot._books[a0.fingerprint].ver == 1
     res = feed(bot, "alice", a0.send("bot", {"t": "list", "master": {"ed25519": "x"}}))
     assert [e.reason for e in res.events if isinstance(e, Dropped)] == ["invalid-list"]
+
+
+# --- prune-on-sight -----------------------------------------------------------
+# cicchetto (grappa-irc PR 2579) sends its signed `t:list` back, unasked, when
+# it decrypts a message naming a device its list does not: at most once per
+# (nick, device) a minute. The bot applies it as any `t:list` (_on_list).
+
+def certified_fourth(net):
+    """alice's a0..a2 listed at 1 in the bot's book, and a3 trusted on its
+    certificate alone: paired at 2, its list never reached the bot."""
+    bot, devs = setup(net, 4)
+    a0, a1, a2, a3 = devs
+    net.relist("alice", [a0, a1, a2], 1)
+    net.pump("bot", bot.send("alice", text("hi")))
+    net.relist("alice", devs, 2)
+    net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
+    net.pump("alice.3", a3.send("bot", text("new laptop")))      # its listreq is lost
+    net.drop = None
+    assert bot._books[a0.fingerprint].ver == 1
+    assert {d.ed25519 for d in bot.devices(a0.fingerprint)} == {d.device_key for d in devs}
+    return bot, devs
+
+
+def bodies_to_alice(net, bot, body):
+    """The dids each Olm message of bot.send(body) holds a body for."""
+    res = bot.send("alice", text(body))
+    net.pump("bot", res)
+    return [set(p["bodies"]) for _, v, p in _messages(res) if v in ("MSG", "PKMSG")]
+
+
+@pytest.mark.parametrize("drop", ["listed", "certified", "both"])
+def test_a_list_sent_on_sight_revokes_what_it_no_longer_holds(net, drop):
+    bot, (a0, a1, a2, a3) = certified_fourth(net)
+    keep = {"listed": [a0, a1, a3], "certified": [a0, a1, a2], "both": [a0, a1]}[drop]
+    gone = [d for d in (a0, a1, a2, a3) if d not in keep]
+    net.relist("alice", keep, 3)                  # identities hold 3 devices now
+    (named,) = bodies_to_alice(net, bot, "to all four")
+    assert named == {d.did for d in (a0, a1, a2, a3)}       # what a0 sees, and answers
+    res = feed(bot, "alice", a0.send("bot", {"t": "list", "master": a0.master_block}))
+    assert not [e for e in res.events if isinstance(e, (Received, Dropped))]
+    assert olm_msgids(res) == set()               # nothing asked back: the list was news
+    assert bot._books[a0.fingerprint].ver == 3
+    assert {d.ed25519 for d in bot.devices(a0.fingerprint)} == {d.device_key for d in keep}
+    assert all(d.identity["curve25519"] not in bot._sessions for d in gone)
+    assert bodies_to_alice(net, bot, "to the three") == [{d.did for d in keep}]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "open point: a device certified for a version above the list prune-on-sight "
+    "sends stays trusted (trust rule 3: a list older than a certificate says "
+    "nothing of its device), so a same-version t:list cannot drop it"))
+def test_a_list_sent_on_sight_at_our_version_drops_a_device_certified_past_it(net):
+    # An interrupted pairing: alice's master certified a3 for list 2, and list
+    # 2 was never published; alice's devices still hold list 1, as the bot
+    # does. a3 writes on its certificate, the bot addresses it, a0 sees a did
+    # its list does not hold and sends list 1: the bot keeps a3, and keeps
+    # addressing it, and a0 keeps answering with list 1, once a minute.
+    from irc_olm.devices import sign_cert
+    bot, devs = setup(net, 4)
+    a0, a1, a2, a3 = devs
+    net.relist("alice", [a0, a1, a2], 1)
+    net.pump("bot", bot.send("alice", text("hi")))
+    a3._cert = sign_cert(a0._master, 2, a3.device_key)
+    net.pump("alice.3", a3.send("bot", text("half paired")))
+    assert a3.device_key in {d.ed25519 for d in bot.devices(a0.fingerprint)}
+    (named,) = bodies_to_alice(net, bot, "to all four")
+    assert a3.did in named
+    feed(bot, "alice", a0.send("bot", {"t": "list", "master": a0.master_block}))
+    assert a3.device_key not in {d.ed25519 for d in bot.devices(a0.fingerprint)}
 
 
 def test_a_challenge_goes_to_every_device_that_wrote_to_us_and_any_may_ack(net):
