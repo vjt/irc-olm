@@ -248,7 +248,10 @@ of `repr()`, but log lengths, never bodies.
   of those devices answers. A CHAL is never a pre-key message and never
   waits for keys (amendment O1): a device we never heard from gets none, and
   a NACKed CHAL is not re-sent on a new session, so its order fails closed,
-  as `ChallengeExpired`. Each one is single use and expires after 15 s.
+  as `ChallengeExpired`. Each one is single use and expires 15 s after its
+  last line can leave at an empty bank: `expires_at` is 15 s plus what its
+  lines cost the flood bank past the ceiling, sized from its plaintext before
+  it is encrypted (one device: 15 s; four: about 30).
 - **Threat model.** Whoever owns the bot's host owns its key and reads its side
   of every conversation. The second factor protects against impersonating the
   human, not against a compromised bot host.
@@ -350,7 +353,7 @@ from the room the second human takes too. A first contact is thus answered
 before its asker asks again (30 s); the orders queued before keep their
 place, started or not, waiting on the bank or on their target's window:
 behind one the KEYS leaves it the reserve (a challenge arriving meanwhile has
-15 s to be answered); and the orders keep their own 36 s whatever was paid.
+its 15 s to be answered); and the orders keep their own 36 s whatever was paid.
 So ahead of text past the floor a minute holds at most 45 s of orders, second
 human and first contacts when the orders spend first, but the orders' 36 s on
 top of what was paid when the first contacts pay first (60 s measured: two to
@@ -443,11 +446,11 @@ pre-key message, three lines) within 12 s, whatever flooders do (measured
 queued ahead, no text message under way that has waited 20 s (the floor), no
 first contact's KEYS whose 8 s ran out before the challenge was queued, no
 KEYS or NACK under way past its own 20 s, and no line of the application's
-own in the last 10 s, each of which adds its cost; and the 15 s
-of a challenge (14 to 15: it expires at a whole second) run from
-`challenge()`, so on first contact they also cover the KEYREQ and the KEYS
-coming back. The application's lines are charged, not held back. The reserve
-also costs a KEYS's second line about 3 s on an idle connection.
+own in the last 10 s, each of which adds its cost; and the window of a
+challenge (15 s, 14 to 15 as it expires at a whole second, plus what its
+lines cost past the bank's ceiling) runs from `challenge()`. The
+application's lines are charged, not held back. The reserve also costs a
+KEYS's second line about 3 s on an idle connection.
 
 The queues are bounded. Each message is queued or refused whole (half a
 fragmented message is worse than none):

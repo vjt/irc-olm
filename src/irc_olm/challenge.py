@@ -3,10 +3,15 @@
 An order given outside the encrypted query (in a channel, or in a plaintext
 query) is bound to the exact line: the bot sends a CHAL inside the verified
 session, and the human's client answers ACK only if it sent exactly that line
-there in the last 15 s. The bot accepts iff the ACK comes back from a device
-of the same master (wire v2: any of its trusted devices may answer), with an
-unused nonce, before it expires. Spec: grappa-irc#2430,
-"Authorising orders"; 15 s is vjt's decision 5.
+there within 30 s of the CHAL's arrival, and only before its expires_at. The
+bot accepts iff the ACK comes back from a device of the same master (wire v2:
+any of its trusted devices may answer), with an unused nonce, before it
+expires. Spec: grappa-irc#2430, "Authorising orders".
+
+The window is vjt's decision 5, as amended (grappa-irc 2575, 2576):
+CHALLENGE_TTL plus the CHAL's own wire time at an empty bank, which grows
+with the devices it carries a body for. The engine sizes it before it
+encrypts (Engine.challenge); new_challenge gives the 15 s alone.
 """
 
 from __future__ import annotations

@@ -25,6 +25,7 @@ no SAS and no trust-on-first-use here; SAS is for humans, in cicchetto.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -42,6 +43,7 @@ from .devices import (MAX_DEVICES, Book, Cert, Device, InvalidBlock, binding, ce
                       sign_master, wire_int)
 from .framing import PayloadError, fold
 from .keys import b64, ed25519_key, is_key, sig_ok, unb64
+from .pacing import FAKE_LAG_CEILING, line_cost
 from .reassembly import Assembled, Reassembler, Rejected
 from .store import StateFile
 
@@ -101,6 +103,19 @@ def encode_inner(inner: dict) -> bytes:
     ValueError (a lone surrogate, NaN, a value JSON has no form for)."""
     return json.dumps(inner, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False).encode()
+
+
+def olm_body_bound(size: int) -> int:
+    """The longest body (unpadded base64) an Olm normal message (type 1) can
+    be for a plaintext of `size` bytes: a version byte, the ratchet key (32
+    bytes, with its tag and length), the chain index (a varint of up to 64
+    bits, 10 bytes, with its tag), the AES-256-CBC ciphertext (PKCS#7: the
+    next multiple of 16 above `size`, with its tag and varint length) and
+    the 8-byte MAC. Exact but for the chain index, a byte for a chain's
+    first 128 messages (tests/test_challenge.py checks it on vodozemac)."""
+    ct = 16 * (size // 16 + 1)
+    raw = 1 + (2 + 32) + (1 + 10) + (1 + (ct.bit_length() + 6) // 7 + ct) + 8
+    return -(-4 * raw // 3)
 
 
 def _with_binding(plaintext: bytes, fb: str) -> bytes:
@@ -204,7 +219,7 @@ class Result:
     # messages that may go ahead of text: the KEYREQ/KEYS/NACK of the
     # protocol (the pacer budgets KEYS and NACK by their verb, a peer draws
     # them), and the messages carrying a CHAL or an ACK. A CHAL carries what
-    # is left of its 15 s: the pacer starts it only while an ACK can still
+    # is left of its window: the pacer starts it only while an ACK can still
     # make it back in time.
     urgent: dict[str, float | None] = field(default_factory=dict)
     # The msgids of the Olm messages a peer drew from us, the REACTIVE lane's
@@ -419,10 +434,7 @@ class Engine:
             try:
                 # Encoded once, here: past this point nothing can fail on it,
                 # in a queue flush or a re-send least of all.
-                if not isinstance(inner, dict):
-                    raise TypeError("an inner message is an object")
-                own = {k: v for k, v in inner.items() if k not in PROTOCOL_INNER}
-                plaintext = encode_inner(own | {"lv": self._ver})
+                plaintext = self._plaintext(inner)
             except (TypeError, ValueError):
                 if expires is None:     # a CHAL's order ends in the book (_lost)
                     res.events.append(SendFailed(nick, "unencodable", 1))
@@ -430,6 +442,14 @@ class Engine:
             urgent = inner.get("t") in URGENT_INNER
             self._send_to(nick, peer, _Outgoing(plaintext, urgent, 1, expires, False), res)
             return res
+
+    def _plaintext(self, inner: dict) -> bytes:
+        """`inner` as Olm encrypts it: our `lv` in place of the fields the
+        engine writes itself. Raises TypeError or ValueError."""
+        if not isinstance(inner, dict):
+            raise TypeError("an inner message is an object")
+        own = {k: v for k, v in inner.items() if k not in PROTOCOL_INNER}
+        return encode_inner(own | {"lv": self._ver})
 
     def _send_to(self, nick: str, peer: Peer, msg: _Outgoing, res: Result, *,
                  want: frozenset[str] | None = None, done: frozenset[str] = frozenset()) -> None:
@@ -550,8 +570,9 @@ class Engine:
             # plus a device trusted on its certificate alone is one more.
             group = list(bodies.items())
             for i in range(0, len(group), MAX_DEVICES):
-                failed += self._emit_group(nick, peer, mtype, dict(group[i:i + MAX_DEVICES]),
-                                           msg, ttl, res)
+                failed += self._grouped(
+                    dict(group[i:i + MAX_DEVICES]),
+                    lambda b: self._emit_bodies(nick, peer, mtype, b, msg, ttl, res))
         for d, before, _ in failed:
             # The session goes back to where it was, leaving the peer no
             # message key to skip (past 40 skipped, Olm forgets the oldest,
@@ -562,13 +583,13 @@ class Engine:
         self._save()        # before any of it leaves: the caller sends it
         return tried
 
-    def _emit_group(self, nick: str, peer: Peer, mtype: int,
-                    bodies: dict[str, tuple[Device, str, str]], msg: _Outgoing,
-                    ttl: float | None, res: Result) -> list[tuple[Device, str, str]]:
-        """`bodies` in one message, else one message each; the bodies that
-        did not fit even alone."""
+    @staticmethod
+    def _grouped(bodies: dict, emit: Callable[[dict], None]) -> list:
+        """`emit(bodies)`, all in one message, else one message each; the
+        bodies that did not fit even alone. `emit` raises PayloadError
+        before it does anything."""
         try:
-            self._emit_bodies(nick, peer, mtype, bodies, msg, ttl, res)
+            emit(bodies)
             return []
         except PayloadError:
             # More than 64 fragments together: one message per device,
@@ -578,22 +599,27 @@ class Engine:
         failed = []
         for addr, body in bodies.items():
             try:
-                self._emit_bodies(nick, peer, mtype, {addr: body}, msg, ttl, res)
+                emit({addr: body})
             except PayloadError:
                 failed.append(body)
         return failed
 
-    def _emit_bodies(self, nick: str, peer: Peer, mtype: int,
-                     bodies: dict[str, tuple[Device, str, str]], msg: _Outgoing,
-                     ttl: float | None, res: Result) -> None:
-        wire = {addr: ct for addr, (_, _, ct) in bodies.items()}
+    def _payload(self, mtype: int, wire: dict[str, str]) -> tuple[str, dict, str]:
+        """The verb, payload and `to` of the Olm message holding the bodies
+        in `wire` ({did: base64}), all of kind `mtype`."""
         if mtype == 0:
             verb, payload = "PKMSG", {"v": WIRE_VERSION, "id": self._id_block,
                                       "master": self.master_ref, "bodies": wire}
         else:
             verb, payload = "MSG", {"v": WIRE_VERSION, "ck": self._id_block["curve25519"],
                                     "bodies": wire}
-        to = next(iter(wire)) if len(wire) == 1 else framing.ANY
+        return verb, payload, next(iter(wire)) if len(wire) == 1 else framing.ANY
+
+    def _emit_bodies(self, nick: str, peer: Peer, mtype: int,
+                     bodies: dict[str, tuple[Device, str, str]], msg: _Outgoing,
+                     ttl: float | None, res: Result) -> None:
+        verb, payload, to = self._payload(
+            mtype, {addr: ct for addr, (_, _, ct) in bodies.items()})
         msgid = self._emit(nick, verb, payload, res, to=to, urgent=msg.urgent, ttl=ttl)
         if msg.reactive:
             res.reactive.add(msgid)
@@ -606,16 +632,20 @@ class Engine:
               ttl: float | None = None) -> str:
         """Frame `payload` for `nick`. Raises PayloadError, before anything is
         added to `res`, when it needs more than 64 fragments."""
-        mask = self.own_mask or framing.conservative_mask(self.nick, self.ident)
         msgid = framing.new_msgid()
-        src = framing.ANY if verb == "KEYS" else self._did   # a KEYS describes the user
-        for body in framing.fragment(verb, framing.encode_payload(payload), src=src, dst=to,
-                                     own_mask=mask, target=nick, linelen=self.linelen,
-                                     msgid=msgid):
+        for body in self._frame(nick, verb, payload, to=to, msgid=msgid):
             res.outbound.append((nick, body))
         if urgent:
             res.urgent[msgid] = ttl
         return msgid
+
+    def _frame(self, nick: str, verb: str, payload: dict, *, to: str,
+               msgid: str | None = None) -> list[str]:
+        """The CTCP bodies `payload` goes to `nick` in, or PayloadError."""
+        mask = self.own_mask or framing.conservative_mask(self.nick, self.ident)
+        src = framing.ANY if verb == "KEYS" else self._did   # a KEYS describes the user
+        return framing.fragment(verb, framing.encode_payload(payload), src=src, dst=to,
+                                own_mask=mask, target=nick, linelen=self.linelen, msgid=msgid)
 
     def discard(self, msgids: list[str]) -> None:
         """Forget the plaintexts of messages the pacer refused
@@ -1075,15 +1105,54 @@ class Engine:
     def challenge(self, nick: str, *, network: str, channel: str, sender_mask: str,
                   line: bytes) -> tuple[Challenge, Result]:
         """Send a CHAL for `line` to the master pinned to `nick`.
-        `network` is the 005 NETWORK token; `line` the raw PRIVMSG text."""
+        `network` is the 005 NETWORK token; `line` the raw PRIVMSG text.
+        It expires CHALLENGE_TTL after its last line can leave at an empty
+        bank (decision 5, amended): one body per device makes a CHAL to
+        four devices five lines or more, the last 13 s or more after the
+        first."""
         with self._lock:
             peer = self.pinned(nick)
             if peer is None:
                 raise NotPinnedError(f"no key pinned to {nick!r}")
             ch = new_challenge(nick=nick, master=peer.master, network=network, channel=channel,
                                sender_mask=sender_mask, line=line, now=self._now())
+            ch = replace(ch, expires_at=ch.expires_at + self._wire_time(nick, peer, ch))
             self._challenges.add(ch)
             return ch, self._send_inner(nick, ch.inner(), expires=ch.expires_at)
+
+    def _wire_time(self, nick: str, peer: Peer, ch: Challenge) -> int:
+        """Whole seconds, at least, from a CHAL's first line leaving at an
+        empty bank to its last: what its lines cost past the bank's ceiling,
+        the URGENT lane's limit. Sized before it is encrypted, from its
+        plaintext's length, on which expires_at weighs by its width alone
+        (ten digits until 2286): sized again should the window widen it."""
+        late, width = 0, None
+        while width != len(str(ch.expires_at + late)):
+            width = len(str(ch.expires_at + late))
+            try:
+                size = len(self._plaintext(replace(ch, expires_at=ch.expires_at + late).inner()))
+            except (TypeError, ValueError):
+                return 0                # never sent (_send_inner): nothing to wait for
+            late = max(0, math.ceil(self._chal_cost(nick, peer, size) - FAKE_LAG_CEILING))
+        return late
+
+    def _chal_cost(self, nick: str, peer: Peer, size: int) -> int:
+        """At least what the lines of a CHAL of `size` plaintext bytes cost
+        the bank (pacing.line_cost, as the pacer charges them): one MSG body
+        per device ready for it, each as long as olm_body_bound allows,
+        grouped and framed as _encrypt does. A CHAL is never a pre-key
+        message (O1): a device whose session would write one gets no body,
+        and counting one for it only overestimates."""
+        ready, _ = self._split(self._books.get(peer.master), None, frozenset())
+        body, costs = "A" * olm_body_bound(size), []
+
+        def cost(bodies: dict) -> None:
+            verb, payload, to = self._payload(1, bodies)
+            costs.append(sum(line_cost(nick, b) for b in self._frame(nick, verb, payload, to=to)))
+
+        for i in range(0, len(ready), MAX_DEVICES):
+            self._grouped({did(d.ed25519): body for d in ready[i:i + MAX_DEVICES]}, cost)
+        return sum(costs)
 
     def _on_ack(self, nick: str, peer: Peer, inner: dict, res: Result) -> None:
         ch, reason = self._challenges.check(str(inner.get("nonce")), peer.master, self._now())

@@ -234,6 +234,11 @@ class FakeLag:
         self._since = now + cost if self._since is None else max(self._since, now) + cost
 
 
+def line_cost(target: str, body: str) -> int:
+    """What the PRIVMSG carrying `body` to `target` costs the bank: what the
+    pacer charges for a line it releases."""
+    return FakeLag.cost(f"PRIVMSG {target} :{body}")
+
 
 class _Line(NamedTuple):
     seq: int
@@ -404,7 +409,7 @@ class Pacer:
                      frag is None or frag.index == frag.total, deadline,
                      frag is not None and frag.verb in OLM_VERBS,
                      frag is not None and frag.verb == "KEYS",
-                     FakeLag.cost(f"PRIVMSG {target} :{line}"))
+                     line_cost(target, line))
 
     def _left_a_gap(self, key: str, messages: int) -> None:
         # The receiver skips the key of an Olm message it never gets when the

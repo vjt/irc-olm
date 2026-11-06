@@ -7,7 +7,9 @@ from irc_olm import framing
 from irc_olm.engine import (OUTQ_MAX, OUTQ_TTL, AckOk, AckRejected, ChallengeExpired,
                             NotPinnedError, Received, Result, SendFailed, SendQueued)
 from irc_olm.challenge import CHALLENGE_TTL
-from irc_olm.pacing import ACK_MARGIN, FakeLag, Lane, Pacer
+from irc_olm.engine import olm_body_bound
+from irc_olm.keys import b64
+from irc_olm.pacing import ACK_MARGIN, FAKE_LAG_CEILING, FakeLag, Lane, Pacer, line_cost
 
 
 def establish(net):
@@ -262,15 +264,20 @@ def test_a_nacked_challenge_is_not_resent_on_a_new_session_nor_a_lost_message(ne
 
 # --- a challenge to a peer with several devices ------------------------------
 
-def devices_heard_from(net, n):
-    """The bot and a user "vjt" with `n` devices, every one of which has
-    written to a session of the bot's: what a CHAL needs (O1). Four are
-    listed; a fifth is trusted on its certificate alone (a list holds four),
-    so a CHAL to five goes as two messages."""
+def devices_heard_from(net, n, quiet=0):
+    """The bot and a user "vjt" with `n` devices, every one of which but the
+    last `quiet` has written to a session of the bot's: what a CHAL needs
+    (O1). The bot's sessions to the quiet ones would still write pre-key
+    bodies, which a CHAL skips. Four are listed; a fifth is trusted on its
+    certificate alone (a list holds four), so a CHAL to five goes as two
+    messages."""
     bot, devs = net.add("bot"), net.add_user("vjt", n)
     net.pin("bot", "vjt")
     net.pin("vjt", "bot")
+    mute = {d.did for d in devs[n - quiet:]}
+    net.drop = lambda src, dst, body: src == "vjt" and framing.parse(body).src in mute
     net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))   # each listreqs back
+    net.drop = None
     if n > 4:
         net.relist("vjt", devs[:3] + devs[4:], 2)                      # devs[4] replaces devs[3]
         net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
@@ -298,27 +305,114 @@ def paced(res, t0=1000.0):
              for msgid, (_, lines) in chals.items()}, pacer.take_dropped())
 
 
-# Known bug: a CHAL to four devices or more never goes. Fixing it needs the
-# 15 s window changed on both sides (cicchetto confirms only a line it sent
-# in the last 15 s, the bot's CHALLENGE_TTL), so the cases stay expected
-# failures until that is agreed: strict, so the fix has to flip them.
-MULTI_DEVICE_DROP = pytest.mark.xfail(
-    strict=True, raises=AssertionError,
-    reason="a CHAL to 4+ devices is dropped unsent even at an empty bank")
-
-
-@pytest.mark.parametrize("n", [1, 2, 3, pytest.param(4, marks=MULTI_DEVICE_DROP),
-                               pytest.param(5, marks=MULTI_DEVICE_DROP)])
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5])
 def test_a_challenge_to_every_device_leaves_at_an_empty_bank_in_time_to_be_answered(net, n):
     # One body per device: a CHAL on a session is 2 lines (8 s of bank) for
     # one device and 5 lines (23 to 24 s) for four, whose last line leaves 13
-    # to 14 s after its first at an empty bank. Its 15 s cannot hold that and
-    # the ACK's way back (ACK_MARGIN): the pacer drops it unsent, every time.
+    # to 14 s after its first at an empty bank. Its window runs 15 s from
+    # that last line (decision 5, amended): the pacer starts it, and the
+    # peer has its 15 s once it has the whole CHAL.
     bot = devices_heard_from(net, n)
-    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
-                           sender_mask="vjt!vjt@host", line=LINE)
+    ch, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                            sender_mask="vjt!vjt@host", line=LINE)
     sent, dropped = paced(res)
     assert len(sent) == (2 if n > 4 else 1)
     assert dropped == []
     for deadline, times in sent.values():
+        assert deadline == 1000.0 + ch.expires_at - net.clock.t      # what the peer is told
         assert None not in times and times[-1] <= deadline - ACK_MARGIN
+        assert deadline - times[-1] >= CHALLENGE_TTL - 1     # it expires at a whole second
+
+
+def chal_cost(res):
+    """What the CHAL lines in `res` cost the bank, as the pacer charges them."""
+    return sum(line_cost(target, body) for target, body in res.outbound
+               if framing.parse(body).msgid in res.urgent)
+
+
+@pytest.mark.parametrize("quiet", [0, 1])
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_a_challenge_is_sized_on_at_least_what_its_lines_cost(net, n, quiet):
+    # Sized before it is encrypted, from its plaintext's length: never below
+    # what its lines cost once they exist, for MSG bodies (the devices that
+    # wrote to us) and for devices whose session would write a pre-key body
+    # (`quiet`: the CHAL skips them, O1), whatever its length does to the
+    # cipher's 16-byte blocks and to the lines.
+    bot = devices_heard_from(net, n, quiet)
+    peer = bot.pinned("vjt")
+    for extra in range(0, 160, 5):
+        now = net.clock.t = net.clock.t + 0.25
+        ch, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                                sender_mask="vjt!vjt@" + "h" * (4 + extra), line=LINE)
+        bound = bot._chal_cost("vjt", peer, len(bot._plaintext(ch.inner())))
+        cost = chal_cost(res)
+        assert len({framing.parse(b).msgid for _, b in res.outbound}) == (n > quiet)
+        assert cost <= bound
+        assert ch.expires_at == int(now) + CHALLENGE_TTL + max(0, bound - FAKE_LAG_CEILING)
+        assert ch.expires_at >= int(now) + CHALLENGE_TTL + cost - FAKE_LAG_CEILING
+
+
+def test_a_challenge_too_long_for_one_message_is_sized_one_message_a_device(net):
+    # Two bodies past 64 fragments together go as one message each
+    # (_grouped), and are sized so.
+    bot = devices_heard_from(net, 2)
+    ch, res = bot.challenge("vjt", network="TestNet", channel="#" + "x" * 12000,
+                            sender_mask="vjt!vjt@host", line=LINE)
+    assert len({framing.parse(b).msgid for _, b in res.outbound}) == 2
+    bound = bot._chal_cost("vjt", bot.pinned("vjt"), len(bot._plaintext(ch.inner())))
+    assert chal_cost(res) <= bound
+    assert ch.expires_at == int(net.clock.t) + CHALLENGE_TTL + bound - FAKE_LAG_CEILING
+
+
+def test_a_challenge_whose_lines_fit_the_bank_gets_its_15_s(net):
+    # One device: two lines, under the bank's ceiling: they all leave at
+    # once at an empty bank, so the window is CHALLENGE_TTL and no more.
+    bot = devices_heard_from(net, 1)
+    ch, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                            sender_mask="vjt!vjt@host", line=LINE)
+    assert chal_cost(res) <= bot._chal_cost("vjt", bot.pinned("vjt"),
+                                            len(bot._plaintext(ch.inner()))) <= FAKE_LAG_CEILING
+    assert ch.expires_at == int(net.clock.t) + CHALLENGE_TTL
+    assert set(res.urgent.values()) == {CHALLENGE_TTL}
+
+
+def test_a_widened_challenge_expires_when_its_peer_is_told_it_does(net):
+    bot = devices_heard_from(net, 4)
+    devs = net.devices["vjt"]
+    for i in range(4):
+        net.take(f"vjt.{i}")
+    ch, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                            sender_mask="vjt!vjt@host", line=LINE)
+    other, more = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                                sender_mask="vjt!vjt@host", line=LINE)
+    assert ch.expires_at > int(net.clock.t) + CHALLENGE_TTL
+    assert other.expires_at == ch.expires_at
+    assert set(res.urgent.values()) == {ch.expires_at - net.clock.t}
+    net.pump("bot", res)
+    told = [e.inner["expires_at"] for i in range(4) for e in net.take(f"vjt.{i}", Received)]
+    assert told == [ch.expires_at] * 4
+    net.clock.t = ch.expires_at
+    assert not [e for e in bot.tick().events if isinstance(e, ChallengeExpired)]
+    net.pump("vjt.3", devs[3].send("bot", {"t": "ack", "nonce": ch.nonce}))
+    assert [e.challenge for e in net.take("bot", AckOk)] == [ch]
+    net.clock.t += 1
+    assert [e.challenge for e in bot.tick().events if isinstance(e, ChallengeExpired)] == [other]
+
+
+def test_olm_body_bound_holds_on_vodozemac():
+    # A normal message on a session that has heard back, past a chain's
+    # first 128 messages (a two-byte chain index): never longer than the
+    # bound, and only the chain index's spare bytes shorter.
+    import vodozemac as vz
+    a, b = vz.Account(), vz.Account()
+    b.generate_one_time_keys(1)
+    (otk,) = b.one_time_keys.values()
+    out = a.create_outbound_session(b.curve25519_key, otk)
+    first = vz.AnyOlmMessage.from_parts(*out.encrypt(b"hi").to_parts())
+    back, _ = b.create_inbound_session(a.curve25519_key, first.to_pre_key())
+    out.decrypt(vz.AnyOlmMessage.from_parts(*back.encrypt(b"ho").to_parts()))
+    for i in range(300):
+        size = (i * 7) % 600
+        mtype, ct = out.encrypt(b"x" * size).to_parts()
+        assert mtype == 1
+        assert 0 <= olm_body_bound(size) - len(b64(ct)) <= 12
