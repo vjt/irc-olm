@@ -7,6 +7,7 @@ from irc_olm import framing
 from irc_olm.engine import (OUTQ_MAX, OUTQ_TTL, AckOk, AckRejected, ChallengeExpired,
                             NotPinnedError, Received, Result, SendFailed, SendQueued)
 from irc_olm.challenge import CHALLENGE_TTL
+from irc_olm.pacing import ACK_MARGIN, FakeLag, Lane, Pacer
 
 
 def establish(net):
@@ -257,3 +258,67 @@ def test_a_nacked_challenge_is_not_resent_on_a_new_session_nor_a_lost_message(ne
     assert net.take("vjt", Received) == []
     net.clock.t += CHALLENGE_TTL + 1
     assert [e for e in bot.tick().events if isinstance(e, ChallengeExpired)]
+
+
+# --- a challenge to a peer with several devices ------------------------------
+
+def devices_heard_from(net, n):
+    """The bot and a user "vjt" with `n` devices, every one of which has
+    written to a session of the bot's: what a CHAL needs (O1). Four are
+    listed; a fifth is trusted on its certificate alone (a list holds four),
+    so a CHAL to five goes as two messages."""
+    bot, devs = net.add("bot"), net.add_user("vjt", n)
+    net.pin("bot", "vjt")
+    net.pin("vjt", "bot")
+    net.pump("bot", bot.send("vjt", {"t": "text", "body": "hello"}))   # each listreqs back
+    if n > 4:
+        net.relist("vjt", devs[:3] + devs[4:], 2)                      # devs[4] replaces devs[3]
+        net.drop = lambda src, dst, body: src == "bot" and framing.parse(body).verb == "MSG"
+        net.pump("vjt.4", devs[4].send("bot", {"t": "text", "body": "new laptop"}))
+        net.drop = None
+    return bot
+
+
+def paced(res, t0=1000.0):
+    """The CHAL messages in `res` through a Pacer at an empty bank, queued as
+    PacedSender.submit_all queues them. Returns {msgid: (deadline, release
+    time of each line)} and what the pacer dropped."""
+    pacer = Pacer(fakelag=FakeLag())
+    msgs = {}
+    for target, body in res.outbound:
+        msgs.setdefault(framing.parse(body).msgid, (target, []))[1].append(body)
+    chals = {m: v for m, v in msgs.items() if res.urgent.get(m) is not None}
+    for msgid, (target, lines) in chals.items():
+        assert pacer.submit(target, lines, lane=Lane.URGENT, deadline=t0 + res.urgent[msgid])
+    left, t = {}, t0
+    while pacer.pending() and t is not None:
+        left |= {line: t for _, line in pacer.due(t)}
+        t = pacer.next_wakeup(t)
+    return ({msgid: (t0 + res.urgent[msgid], [left.get(line) for line in lines])
+             for msgid, (_, lines) in chals.items()}, pacer.take_dropped())
+
+
+# Known bug: a CHAL to four devices or more never goes. Fixing it needs the
+# 15 s window changed on both sides (cicchetto confirms only a line it sent
+# in the last 15 s, the bot's CHALLENGE_TTL), so the cases stay expected
+# failures until that is agreed: strict, so the fix has to flip them.
+MULTI_DEVICE_DROP = pytest.mark.xfail(
+    strict=True, raises=AssertionError,
+    reason="a CHAL to 4+ devices is dropped unsent even at an empty bank")
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, pytest.param(4, marks=MULTI_DEVICE_DROP),
+                               pytest.param(5, marks=MULTI_DEVICE_DROP)])
+def test_a_challenge_to_every_device_leaves_at_an_empty_bank_in_time_to_be_answered(net, n):
+    # One body per device: a CHAL on a session is 2 lines (8 s of bank) for
+    # one device and 5 lines (23 to 24 s) for four, whose last line leaves 13
+    # to 14 s after its first at an empty bank. Its 15 s cannot hold that and
+    # the ACK's way back (ACK_MARGIN): the pacer drops it unsent, every time.
+    bot = devices_heard_from(net, n)
+    _, res = bot.challenge("vjt", network="TestNet", channel="#sbiffo",
+                           sender_mask="vjt!vjt@host", line=LINE)
+    sent, dropped = paced(res)
+    assert len(sent) == (2 if n > 4 else 1)
+    assert dropped == []
+    for deadline, times in sent.values():
+        assert None not in times and times[-1] <= deadline - ACK_MARGIN
