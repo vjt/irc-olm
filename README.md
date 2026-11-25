@@ -60,7 +60,9 @@ To print the bot's own master key for pasting into the other side
 There is one identity (a master key and one Olm device under it), and so one
 state file and one key, per network. The state
 file is replaced atomically on every change, at mode 600. A state file or key
-that group or others can read is refused, the way ssh refuses a private key.
+that group or others can read is refused, the way ssh refuses a private key,
+except a root-owned one that only the bot's own group can read (640
+root:<group>): the bot reads it and cannot rewrite it.
 
 ## Wiring it into a bot
 

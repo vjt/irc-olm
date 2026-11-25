@@ -52,6 +52,34 @@ def test_load_key_refuses_group_or_world_access(tmp_path, perm):
         store.load_key(p)
 
 
+def owned_by(monkeypatch, uid, gid):
+    real = os.stat
+
+    def fake(path, *args, **kwargs):
+        st = real(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid, gid, *st[6:10]))
+
+    monkeypatch.setattr(store.os, "stat", fake)
+
+
+def test_load_key_accepts_root_handing_it_to_our_group(tmp_path, monkeypatch):
+    p = tmp_path / "olm.key"
+    store.generate_key_file(p)
+    os.chmod(p, 0o640)
+    owned_by(monkeypatch, 0, os.getegid())
+    assert len(store.load_key(p)) == store.KEY_BYTES
+
+
+@pytest.mark.parametrize("our_group, perm", [(False, 0o640), (True, 0o660), (True, 0o644)])
+def test_load_key_refuses_other_root_owned_modes(tmp_path, monkeypatch, our_group, perm):
+    p = tmp_path / "olm.key"
+    store.generate_key_file(p)
+    os.chmod(p, perm)
+    owned_by(monkeypatch, 0, os.getegid() if our_group else os.getegid() + 1)
+    with pytest.raises(store.InsecureFileError):
+        store.load_key(p)
+
+
 @pytest.mark.parametrize("content", ["", "not base64!", base64.b64encode(b"short").decode()])
 def test_load_key_refuses_a_malformed_key(tmp_path, content):
     p = tmp_path / "olm.key"

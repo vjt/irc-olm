@@ -31,8 +31,12 @@ class KeyFileError(ValueError):
 
 
 def _check_private(path: Path) -> None:
-    perm = stat.S_IMODE(os.stat(path).st_mode)
-    if perm & 0o077:
+    st = os.stat(path)
+    perm = stat.S_IMODE(st.st_mode)
+    # Root may hand a key to this process's group read-only (640 root:<group>):
+    # the bot can read it and never rewrite it.
+    handed = st.st_uid == 0 and st.st_gid == os.getegid()
+    if perm & (0o037 if handed else 0o077):
         raise InsecureFileError(f"{path} is mode {perm:o}: must not be accessible to group or others")
 
 
